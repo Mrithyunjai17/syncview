@@ -11,15 +11,13 @@ export default function ScreenSharePlayer({
   onStop,
   roomConnected,
 }) {
-  const showPreview = isHost && sharing;
-  const showRemote = !isHost && isLive;
-  const videoRef = showPreview ? localVideoRef : remoteVideoRef;
-  const hasStream = showPreview || (showRemote && connected);
+  const videoRef = isHost ? localVideoRef : remoteVideoRef;
+  const hasStream = (isHost && sharing) || (!isHost && isLive && connected);
 
   return (
     <div className="player-panel">
       <div className="player-shell">
-        <video ref={videoRef} playsInline autoPlay controls={false} className="screen-video" />
+        <video ref={videoRef} playsInline autoPlay muted={isHost} controls={false} className="screen-video" />
 
         {!isLive && !sharing && (
           <div className="player-empty">
