@@ -65,7 +65,7 @@ export default function SyncedVideoPlayer({ socket, isHost, playback, connected 
     video.playbackRate = state.playbackRate || 1;
 
     if (state.isPlaying) {
-      video.play().catch(() => {});
+      video.play().catch(() => { });
       setIsPlaying(true);
     } else {
       video.pause();
@@ -112,6 +112,10 @@ export default function SyncedVideoPlayer({ socket, isHost, playback, connected 
 
     return () => clearInterval(interval);
   }, [socket, isHost, connected, applyPlaybackState]);
+
+  useEffect(() => {
+    return () => destroyHls();
+  }, [destroyHls]);
 
   useEffect(() => {
     const video = videoRef.current;
