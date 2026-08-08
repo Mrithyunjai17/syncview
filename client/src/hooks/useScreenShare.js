@@ -37,14 +37,14 @@ export function useScreenShare({ socket, isHost, screenShare, members }) {
     cleanupPeers();
     setSharing(false);
     setConnected(false);
-    socket.emit('screen:stop', {}, () => {});
+    socket.emit('screen:stop', {}, () => { });
   }, [socket, isHost, stopLocalStream, cleanupPeers]);
 
   const attachLocalPreview = useCallback((stream) => {
     if (localVideoRef.current) {
       localVideoRef.current.srcObject = stream;
       localVideoRef.current.muted = true;
-      localVideoRef.current.play().catch(() => {});
+      localVideoRef.current.play().catch(() => { });
     }
   }, []);
 
@@ -198,7 +198,7 @@ export function useScreenShare({ socket, isHost, screenShare, members }) {
         const [stream] = event.streams;
         if (stream && remoteVideoRef.current) {
           remoteVideoRef.current.srcObject = stream;
-          remoteVideoRef.current.play().catch(() => {});
+          remoteVideoRef.current.play().catch(() => { });
           setConnected(true);
         }
       };
@@ -235,6 +235,7 @@ export function useScreenShare({ socket, isHost, screenShare, members }) {
       cleanupPeers();
       stopLocalStream();
       setConnected(false);
+      setSharing(false);
     };
 
     socket.on('webrtc:offer', onOffer);
@@ -255,13 +256,13 @@ export function useScreenShare({ socket, isHost, screenShare, members }) {
   }, [socket, isHost, screenShare?.active, cleanupPeers, stopLocalStream]);
 
   useEffect(() => {
-    if (isHost && !screenShare?.active && sharing) {
+    if (!isHost && sharing) {
       stopLocalStream();
       cleanupPeers();
       setSharing(false);
       setConnected(false);
     }
-  }, [isHost, screenShare?.active, sharing, stopLocalStream, cleanupPeers]);
+  }, [isHost, sharing, stopLocalStream, cleanupPeers]);
 
   useEffect(() => {
     return () => {
