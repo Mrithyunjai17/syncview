@@ -14,6 +14,37 @@ function getIceServers() {
 }
 
 const RTC_CONFIG = getIceServers();
+const TARGET_WIDTH = 1280;
+const TARGET_HEIGHT = 720;
+const TARGET_FPS = 30;
+const TOTAL_VIDEO_BUDGET = 5_000_000;
+
+async function tuneSender(sender, peerCount) {
+  const track = sender.track;
+  if (!track) return;
+  const parameters = sender.getParameters();
+  if (!parameters.encodings?.length) parameters.encodings = [{}];
+
+  if (track.kind === 'video') {
+    const settings = track.getSettings();
+    const scale = Math.max(
+      1,
+      (settings.width || TARGET_WIDTH) / TARGET_WIDTH,
+      (settings.height || TARGET_HEIGHT) / TARGET_HEIGHT,
+    );
+    parameters.degradationPreference = 'maintain-framerate';
+    parameters.encodings[0].maxBitrate = Math.max(
+      900_000,
+      Math.min(2_500_000, Math.floor(TOTAL_VIDEO_BUDGET / Math.max(1, peerCount))),
+    );
+    parameters.encodings[0].maxFramerate = TARGET_FPS;
+    parameters.encodings[0].scaleResolutionDownBy = scale;
+  } else if (track.kind === 'audio') {
+    parameters.encodings[0].maxBitrate = 128_000;
+  }
+
+  await sender.setParameters(parameters).catch(() => {});
+}
 
 export function useScreenShare({ socket, isHost, screenShare }) {
   const localVideoRef = useRef(null);
@@ -31,15 +62,23 @@ export function useScreenShare({ socket, isHost, screenShare }) {
   const [needsPlayback, setNeedsPlayback] = useState(false);
   const [error, setError] = useState('');
 
+  const rebalanceHostSenders = useCallback(() => {
+    const peerCount = peersRef.current.size;
+    peersRef.current.forEach((pc) => {
+      pc.getSenders().forEach((sender) => tuneSender(sender, peerCount));
+    });
+  }, []);
+
   const closePeer = useCallback((viewerId) => {
     const pc = peersRef.current.get(viewerId);
     if (pc) pc.close();
     peersRef.current.delete(viewerId);
     pendingHostIceRef.current.delete(viewerId);
+    rebalanceHostSenders();
     setConnected(
       [...peersRef.current.values()].some((peer) => peer.connectionState === 'connected'),
     );
-  }, []);
+  }, [rebalanceHostSenders]);
 
   const cleanupPeers = useCallback(() => {
     peersRef.current.forEach((pc) => pc.close());
@@ -79,7 +118,9 @@ export function useScreenShare({ socket, isHost, screenShare }) {
     const pc = new RTCPeerConnection(RTC_CONFIG);
     peersRef.current.set(viewerId, pc);
     pendingHostIceRef.current.set(viewerId, []);
-    stream.getTracks().forEach((track) => pc.addTrack(track, stream));
+    const senders = stream.getTracks().map((track) => pc.addTrack(track, stream));
+    await Promise.all(senders.map((sender) => tuneSender(sender, peersRef.current.size)));
+    rebalanceHostSenders();
 
     pc.onicecandidate = ({ candidate }) => {
       if (candidate) socket.emit('webrtc:ice-candidate', { to: viewerId, candidate });
@@ -98,7 +139,7 @@ export function useScreenShare({ socket, isHost, screenShare }) {
     } catch {
       closePeer(viewerId);
     }
-  }, [socket, closePeer]);
+  }, [socket, closePeer, rebalanceHostSenders]);
 
   const startSharing = useCallback(async () => {
     if (!socket || !isHost || sharing) return;
@@ -118,7 +159,11 @@ export function useScreenShare({ socket, isHost, screenShare }) {
       let stream;
       try {
         stream = await navigator.mediaDevices.getDisplayMedia({
-          video: { frameRate: { ideal: 30 } },
+          video: {
+            width: { ideal: TARGET_WIDTH, max: 1920 },
+            height: { ideal: TARGET_HEIGHT, max: 1080 },
+            frameRate: { ideal: TARGET_FPS, max: TARGET_FPS },
+          },
           audio: true,
           preferCurrentTab: true,
           selfBrowserSurface: 'exclude',
@@ -133,12 +178,20 @@ export function useScreenShare({ socket, isHost, screenShare }) {
           throw captureError;
         }
       }
+      const videoTrack = stream.getVideoTracks()[0];
+      if (videoTrack) {
+        videoTrack.contentHint = 'motion';
+        await videoTrack.applyConstraints({
+          width: { ideal: TARGET_WIDTH, max: 1920 },
+          height: { ideal: TARGET_HEIGHT, max: 1080 },
+          frameRate: { ideal: TARGET_FPS, max: TARGET_FPS },
+        }).catch(() => {});
+      }
       streamRef.current = stream;
       if (localVideoRef.current) {
         localVideoRef.current.srcObject = stream;
         await localVideoRef.current.play().catch(() => {});
       }
-      const videoTrack = stream.getVideoTracks()[0];
       if (videoTrack) videoTrack.onended = stopSharing;
 
       socket.emit('screen:start', { title: 'Live screen share' }, (response) => {
