@@ -40,7 +40,7 @@ const rooms = new Map();
  * @property {string} name
  * @property {string} hostId
  * @property {{ active: boolean, title: string, startedAt: number | null }} screenShare
- * @property {Array<{id: string, name: string, joinedAt: number, voiceEnabled: boolean}>} members
+ * @property {Array<{id: string, name: string, joinedAt: number, voiceEnabled: boolean, voiceMuted: boolean}>} members
  * @property {Array<{id: string, user: string, text: string, at: number}>} messages
  * @property {number} createdAt
  */
@@ -144,6 +144,7 @@ io.on('connection', (socket) => {
         name: userName,
         joinedAt: Date.now(),
         voiceEnabled: false,
+        voiceMuted: false,
       });
       room.messages.push({
         id: nanoid(),
@@ -223,13 +224,27 @@ io.on('connection', (socket) => {
     io.to(room.hostId).emit('webrtc:viewer-ready', { viewerId: socket.id });
   });
 
-  socket.on('voice:state', ({ enabled }, ack) => {
+  socket.on('voice:state', ({ enabled, muted }, ack) => {
     const room = rooms.get(currentRoomId);
     const member = room?.members.find((entry) => entry.id === socket.id);
     if (!room || !member) return ack?.({ ok: false });
     member.voiceEnabled = Boolean(enabled);
+    member.voiceMuted = member.voiceEnabled ? Boolean(muted) : false;
+    if (!member.voiceEnabled || member.voiceMuted) {
+      io.to(currentRoomId).emit('voice:activity', { memberId: socket.id, speaking: false });
+    }
     io.to(currentRoomId).emit('room:update', serializeRoom(room));
     ack?.({ ok: true });
+  });
+
+  socket.on('voice:activity', ({ speaking }) => {
+    const room = rooms.get(currentRoomId);
+    const member = room?.members.find((entry) => entry.id === socket.id);
+    if (!room || !member?.voiceEnabled || member.voiceMuted) return;
+    socket.to(currentRoomId).emit('voice:activity', {
+      memberId: socket.id,
+      speaking: Boolean(speaking),
+    });
   });
 
   socket.on('voice:signal', ({ to, type, data }) => {

@@ -19,11 +19,60 @@ export function useVoiceChat({ socket, members = [] }) {
   const audioRef = useRef(new Map());
   const pendingIceRef = useRef(new Map());
   const joinedRef = useRef(false);
+  const activityTimerRef = useRef(null);
+  const audioContextRef = useRef(null);
+  const speakingRef = useRef(false);
   const [joined, setJoined] = useState(false);
   const [muted, setMuted] = useState(false);
   const [error, setError] = useState('');
   const [blockedAudio, setBlockedAudio] = useState(false);
   const [connectedPeers, setConnectedPeers] = useState(0);
+  const [speakingIds, setSpeakingIds] = useState(() => new Set());
+
+  const setSpeaking = useCallback((memberId, speaking) => {
+    setSpeakingIds((current) => {
+      const next = new Set(current);
+      if (speaking) next.add(memberId);
+      else next.delete(memberId);
+      return next;
+    });
+  }, []);
+
+  const stopActivityMonitor = useCallback(() => {
+    if (activityTimerRef.current) window.clearInterval(activityTimerRef.current);
+    activityTimerRef.current = null;
+    audioContextRef.current?.close().catch(() => {});
+    audioContextRef.current = null;
+    speakingRef.current = false;
+  }, []);
+
+  const startActivityMonitor = useCallback((stream) => {
+    stopActivityMonitor();
+    const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+    if (!AudioContextClass) return;
+    const context = new AudioContextClass();
+    const analyser = context.createAnalyser();
+    analyser.fftSize = 512;
+    context.createMediaStreamSource(stream).connect(analyser);
+    const samples = new Uint8Array(analyser.fftSize);
+    let quietTicks = 0;
+    audioContextRef.current = context;
+    activityTimerRef.current = window.setInterval(() => {
+      analyser.getByteTimeDomainData(samples);
+      let sum = 0;
+      for (const sample of samples) {
+        const normalized = (sample - 128) / 128;
+        sum += normalized * normalized;
+      }
+      const active = Math.sqrt(sum / samples.length) > 0.035;
+      quietTicks = active ? 0 : quietTicks + 1;
+      const speaking = active || (speakingRef.current && quietTicks < 4);
+      if (speaking === speakingRef.current) return;
+      speakingRef.current = speaking;
+      setSpeaking(socket.id, speaking);
+      socket.emit('voice:activity', { speaking });
+    }, 120);
+  }, [socket, setSpeaking, stopActivityMonitor]);
 
   const updateConnectedCount = useCallback(() => {
     setConnectedPeers(
@@ -112,30 +161,42 @@ export function useVoiceChat({ socket, members = [] }) {
       joinedRef.current = true;
       setJoined(true);
       setMuted(false);
-      socket.emit('voice:state', { enabled: true });
+      setSpeakingIds(new Set());
+      startActivityMonitor(stream);
+      socket.emit('voice:state', { enabled: true, muted: false });
     } catch {
       setError('Microphone access was blocked. Allow microphone permission and try again.');
     }
-  }, [socket]);
+  }, [socket, startActivityMonitor]);
 
   const leaveVoice = useCallback(() => {
     joinedRef.current = false;
     streamRef.current?.getTracks().forEach((track) => track.stop());
     streamRef.current = null;
+    socket?.emit('voice:activity', { speaking: false });
+    stopActivityMonitor();
     closeAllPeers();
-    socket?.emit('voice:state', { enabled: false });
+    socket?.emit('voice:state', { enabled: false, muted: false });
     setJoined(false);
     setMuted(false);
     setBlockedAudio(false);
     setConnectedPeers(0);
-  }, [socket, closeAllPeers]);
+    setSpeakingIds(new Set());
+  }, [socket, closeAllPeers, stopActivityMonitor]);
 
   const toggleMute = useCallback(() => {
     const track = streamRef.current?.getAudioTracks()[0];
     if (!track) return;
     track.enabled = !track.enabled;
-    setMuted(!track.enabled);
-  }, []);
+    const nextMuted = !track.enabled;
+    setMuted(nextMuted);
+    if (nextMuted) {
+      speakingRef.current = false;
+      setSpeaking(socket.id, false);
+      socket.emit('voice:activity', { speaking: false });
+    }
+    socket.emit('voice:state', { enabled: true, muted: nextMuted });
+  }, [socket, setSpeaking]);
 
   const resumeAudio = useCallback(async () => {
     const results = await Promise.allSettled(
@@ -185,8 +246,13 @@ export function useVoiceChat({ socket, members = [] }) {
       }
     };
     socket.on('voice:signal', onSignal);
-    return () => socket.off('voice:signal', onSignal);
-  }, [socket, createPeer, closePeer]);
+    const onActivity = ({ memberId, speaking }) => setSpeaking(memberId, speaking);
+    socket.on('voice:activity', onActivity);
+    return () => {
+      socket.off('voice:signal', onSignal);
+      socket.off('voice:activity', onActivity);
+    };
+  }, [socket, createPeer, closePeer, setSpeaking]);
 
   useEffect(() => {
     if (!joined || !socket) return;
@@ -203,8 +269,9 @@ export function useVoiceChat({ socket, members = [] }) {
 
   useEffect(() => () => {
     streamRef.current?.getTracks().forEach((track) => track.stop());
+    stopActivityMonitor();
     closeAllPeers();
-  }, [closeAllPeers]);
+  }, [closeAllPeers, stopActivityMonitor]);
 
   return {
     joined,
@@ -212,6 +279,8 @@ export function useVoiceChat({ socket, members = [] }) {
     error,
     blockedAudio,
     connectedPeers,
+    speakingIds,
+    selfId: socket?.id,
     joinVoice,
     leaveVoice,
     toggleMute,

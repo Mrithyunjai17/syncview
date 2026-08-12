@@ -5,7 +5,9 @@ SyncView creates private rooms where a host can broadcast a browser tab, window,
 ## Features
 
 - Host screen sharing with tab/system audio when the browser supports it
+- Viewer volume, mute, fullscreen, and color-correction controls
 - Multi-user voice chat with echo cancellation, mute, and leave controls
+- Voice participant avatars with speaking and muted indicators
 - Text chat and a people list
 - Shareable room links and transferable host role
 - Automatic WebRTC reconnection handling and ICE candidate queuing

@@ -52,6 +52,20 @@ await emitAck(voicePeer, 'room:join', { roomId: room.id, name: 'Voice peer' });
 assert((await emitAck(host, 'voice:state', { enabled: true })).ok, 'Host voice state failed');
 assert((await emitAck(voicePeer, 'voice:state', { enabled: true })).ok, 'Peer voice state failed');
 
+const mutedRoomUpdate = new Promise((resolve) => {
+  host.on('room:update', (updatedRoom) => {
+    if (updatedRoom.members.find((member) => member.id === voicePeer.id)?.voiceMuted) resolve(updatedRoom);
+  });
+});
+await emitAck(voicePeer, 'voice:state', { enabled: true, muted: true });
+assert(await Promise.race([mutedRoomUpdate, wait(1000).then(() => null)]), 'Muted voice state was not broadcast');
+await emitAck(voicePeer, 'voice:state', { enabled: true, muted: false });
+
+const activityRelay = new Promise((resolve) => host.once('voice:activity', resolve));
+voicePeer.emit('voice:activity', { speaking: true });
+const activity = await Promise.race([activityRelay, wait(1000).then(() => null)]);
+assert(activity?.memberId === voicePeer.id && activity?.speaking, 'Voice activity was not relayed');
+
 const relayedSignal = new Promise((resolve) => {
   voicePeer.once('voice:signal', resolve);
 });
@@ -67,4 +81,4 @@ await emitAck(host, 'screen:stop', {});
 host.disconnect();
 voicePeer.disconnect();
 
-console.log('Smoke test passed: room, screen lifecycle, disconnect regression, and voice signaling.');
+console.log('Smoke test passed: room, screen lifecycle, mute state, speaking activity, and voice signaling.');
