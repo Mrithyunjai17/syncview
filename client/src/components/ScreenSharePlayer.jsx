@@ -7,12 +7,15 @@ export default function ScreenSharePlayer({
   connected,
   needsPlayback,
   error,
+  quality,
+  qualityProfiles,
   title,
   localVideoRef,
   remoteVideoRef,
   onStart,
   onStop,
   onResumePlayback,
+  onQualityChange,
   roomConnected,
 }) {
   const shellRef = useRef(null);
@@ -96,6 +99,16 @@ export default function ScreenSharePlayer({
         </div>
 
         <div className="media-controls">
+          {isHost && (
+            <label className="quality-control">
+              <span>Quality</span>
+              <select value={quality} onChange={(event) => onQualityChange(event.target.value)}>
+                {Object.entries(qualityProfiles).map(([value, profile]) => (
+                  <option value={value} key={value}>{profile.label}</option>
+                ))}
+              </select>
+            </label>
+          )}
           {!isHost && isLive && (
             <>
               <button className="icon-button" onClick={() => setSoundMuted((value) => !value)} aria-label={soundMuted ? 'Unmute screen audio' : 'Mute screen audio'}>

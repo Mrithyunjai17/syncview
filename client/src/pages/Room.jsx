@@ -75,12 +75,15 @@ export default function Room() {
             connected={screenShare.connected}
             needsPlayback={screenShare.needsPlayback}
             error={screenShare.error}
+            quality={screenShare.quality}
+            qualityProfiles={screenShare.qualityProfiles}
             title={room.screenShare?.title}
             localVideoRef={screenShare.localVideoRef}
             remoteVideoRef={screenShare.remoteVideoRef}
             onStart={screenShare.startSharing}
             onStop={screenShare.stopSharing}
             onResumePlayback={screenShare.resumePlayback}
+            onQualityChange={screenShare.setQuality}
             roomConnected={connected}
           />
           <VoiceChat voice={voice} members={room.members} />

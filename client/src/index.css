@@ -562,6 +562,23 @@ a {
   accent-color: var(--accent);
 }
 
+.quality-control {
+  display: grid;
+  gap: 0.15rem;
+  color: var(--text-muted);
+  font-size: 0.7rem;
+}
+
+.quality-control select {
+  min-height: 38px;
+  padding: 0.4rem 2rem 0.4rem 0.65rem;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: var(--bg-panel);
+  color: var(--text);
+  outline: none;
+}
+
 .player-shell:fullscreen {
   width: 100vw;
   height: 100vh;
