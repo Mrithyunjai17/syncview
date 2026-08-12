@@ -3,12 +3,14 @@ export default function ScreenSharePlayer({
   isLive,
   sharing,
   connected,
+  needsPlayback,
   error,
   title,
   localVideoRef,
   remoteVideoRef,
   onStart,
   onStop,
+  onResumePlayback,
   roomConnected,
 }) {
   const videoRef = isHost ? localVideoRef : remoteVideoRef;
@@ -47,6 +49,16 @@ export default function ScreenSharePlayer({
             </div>
           </div>
         )}
+
+        {!isHost && needsPlayback && (
+          <div className="player-empty overlay playback-gate">
+            <div>
+              <strong>Ready to watch</strong>
+              <p>Your browser needs one click before it can play sound.</p>
+              <button className="btn btn-primary" onClick={onResumePlayback}>Play screen share</button>
+            </div>
+          </div>
+        )}
       </div>
 
       <div className="player-controls">
@@ -62,7 +74,7 @@ export default function ScreenSharePlayer({
               </button>
             )}
             <span className="time-readout">
-              {sharing ? 'Pick the movie tab or full screen in the browser prompt' : 'Share a tab for best audio'}
+              {sharing ? 'Your selected screen is being broadcast' : 'Share a browser tab for the best audio'}
             </span>
           </>
         ) : (

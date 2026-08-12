@@ -18,7 +18,7 @@ Render deploys from GitHub. If you don't have a repo yet:
 cd "C:\Users\mrith\OneDrive\Desktop\Practice\Online Viewing"
 git init
 git add .
-git commit -m "Initial SyncView watch party app"
+git commit -m "Initial SyncView screen sharing app"
 git branch -M main
 git remote add origin https://github.com/YOUR_USERNAME/syncview.git
 git push -u origin main
@@ -64,7 +64,7 @@ Open that link on **any device** — phone, tablet, another PC — and it works.
 ## Step 3 — Share with friends
 
 1. Open your public URL
-2. Create a watch party
+2. Create a screen sharing room
 3. Copy the invite link — it will use your public domain automatically
 4. Send it to friends; they join from anywhere
 

@@ -1,30 +1,56 @@
-import { useEffect, useRef, useState, useCallback } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 
-const ICE_SERVERS = {
-  iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
-};
+function getIceServers() {
+  const iceServers = [{ urls: 'stun:stun.l.google.com:19302' }];
+  const turnUrl = import.meta.env.VITE_TURN_URL;
+  if (turnUrl) {
+    iceServers.push({
+      urls: turnUrl.split(',').map((url) => url.trim()),
+      username: import.meta.env.VITE_TURN_USERNAME || '',
+      credential: import.meta.env.VITE_TURN_CREDENTIAL || '',
+    });
+  }
+  return { iceServers };
+}
 
-export function useScreenShare({ socket, isHost, screenShare, members }) {
+const RTC_CONFIG = getIceServers();
+
+export function useScreenShare({ socket, isHost, screenShare }) {
   const localVideoRef = useRef(null);
   const remoteVideoRef = useRef(null);
   const streamRef = useRef(null);
   const peersRef = useRef(new Map());
   const hostPcRef = useRef(null);
+  const pendingHostIceRef = useRef(new Map());
+  const pendingViewerIceRef = useRef([]);
+  const requestedShareRef = useRef(null);
+  const stoppingRef = useRef(false);
 
   const [sharing, setSharing] = useState(false);
   const [connected, setConnected] = useState(false);
+  const [needsPlayback, setNeedsPlayback] = useState(false);
   const [error, setError] = useState('');
+
+  const closePeer = useCallback((viewerId) => {
+    const pc = peersRef.current.get(viewerId);
+    if (pc) pc.close();
+    peersRef.current.delete(viewerId);
+    pendingHostIceRef.current.delete(viewerId);
+    setConnected(
+      [...peersRef.current.values()].some((peer) => peer.connectionState === 'connected'),
+    );
+  }, []);
 
   const cleanupPeers = useCallback(() => {
     peersRef.current.forEach((pc) => pc.close());
     peersRef.current.clear();
-    if (hostPcRef.current) {
-      hostPcRef.current.close();
-      hostPcRef.current = null;
-    }
+    pendingHostIceRef.current.clear();
+    pendingViewerIceRef.current = [];
+    if (hostPcRef.current) hostPcRef.current.close();
+    hostPcRef.current = null;
   }, []);
 
-  const stopLocalStream = useCallback(() => {
+  const clearMedia = useCallback(() => {
     streamRef.current?.getTracks().forEach((track) => track.stop());
     streamRef.current = null;
     if (localVideoRef.current) localVideoRef.current.srcObject = null;
@@ -32,251 +58,218 @@ export function useScreenShare({ socket, isHost, screenShare, members }) {
   }, []);
 
   const stopSharing = useCallback(() => {
-    if (!socket || !isHost) return;
-    stopLocalStream();
+    if (!isHost || stoppingRef.current) return;
+    stoppingRef.current = true;
+    clearMedia();
     cleanupPeers();
     setSharing(false);
     setConnected(false);
-    socket.emit('screen:stop', {}, () => { });
-  }, [socket, isHost, stopLocalStream, cleanupPeers]);
+    setNeedsPlayback(false);
+    socket?.emit('screen:stop', {}, () => {
+      stoppingRef.current = false;
+    });
+    if (!socket) stoppingRef.current = false;
+  }, [socket, isHost, clearMedia, cleanupPeers]);
 
-  const attachLocalPreview = useCallback((stream) => {
-    if (localVideoRef.current) {
-      localVideoRef.current.srcObject = stream;
-      localVideoRef.current.muted = true;
-      localVideoRef.current.play().catch(() => { });
-    }
-  }, []);
+  const createHostPeer = useCallback(async (viewerId) => {
+    const stream = streamRef.current;
+    if (!socket || !stream || !viewerId) return;
+    closePeer(viewerId);
 
-  const createHostPeer = useCallback(
-    async (viewerId, stream) => {
-      if (peersRef.current.has(viewerId)) {
-        peersRef.current.get(viewerId).close();
-        peersRef.current.delete(viewerId);
-      }
+    const pc = new RTCPeerConnection(RTC_CONFIG);
+    peersRef.current.set(viewerId, pc);
+    pendingHostIceRef.current.set(viewerId, []);
+    stream.getTracks().forEach((track) => pc.addTrack(track, stream));
 
-      const pc = new RTCPeerConnection(ICE_SERVERS);
-      stream.getTracks().forEach((track) => pc.addTrack(track, stream));
+    pc.onicecandidate = ({ candidate }) => {
+      if (candidate) socket.emit('webrtc:ice-candidate', { to: viewerId, candidate });
+    };
+    pc.onconnectionstatechange = () => {
+      setConnected(
+        [...peersRef.current.values()].some((peer) => peer.connectionState === 'connected'),
+      );
+      if (['failed', 'closed'].includes(pc.connectionState)) closePeer(viewerId);
+    };
 
-      pc.onicecandidate = (event) => {
-        if (event.candidate) {
-          socket.emit('webrtc:ice-candidate', { to: viewerId, candidate: event.candidate });
-        }
-      };
-
-      pc.onconnectionstatechange = () => {
-        if (pc.connectionState === 'connected') setConnected(true);
-        if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
-          pc.close();
-          peersRef.current.delete(viewerId);
-        }
-      };
-
-      peersRef.current.set(viewerId, pc);
-
-      const offer = await pc.createOffer({
-        offerToReceiveAudio: false,
-        offerToReceiveVideo: false,
-      });
+    try {
+      const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
       socket.emit('webrtc:offer', { to: viewerId, offer: pc.localDescription });
-    },
-    [socket],
-  );
-
-  const connectToExistingViewers = useCallback(
-    (stream) => {
-      if (!socket || !members) return;
-      members
-        .filter((member) => member.id !== socket.id)
-        .forEach((member) => {
-          createHostPeer(member.id, stream);
-        });
-    },
-    [socket, members, createHostPeer],
-  );
+    } catch {
+      closePeer(viewerId);
+    }
+  }, [socket, closePeer]);
 
   const startSharing = useCallback(async () => {
     if (!socket || !isHost || sharing) return;
     setError('');
-
     try {
       const stream = await navigator.mediaDevices.getDisplayMedia({
-        video: {
-          frameRate: { ideal: 30, max: 60 }
-        },
+        video: { frameRate: { ideal: 30, max: 60 } },
         audio: true,
-        preferCurrentTab: false,
+        preferCurrentTab: true,
         selfBrowserSurface: 'exclude',
         systemAudio: 'include',
       });
-
       streamRef.current = stream;
-      attachLocalPreview(stream);
-
-      const videoTrack = stream.getVideoTracks()[0];
-      if (videoTrack) {
-        videoTrack.onended = () => stopSharing();
+      if (localVideoRef.current) {
+        localVideoRef.current.srcObject = stream;
+        await localVideoRef.current.play().catch(() => {});
       }
+      const videoTrack = stream.getVideoTracks()[0];
+      if (videoTrack) videoTrack.onended = stopSharing;
 
       socket.emit('screen:start', { title: 'Live screen share' }, (response) => {
         if (!response?.ok) {
-          setError(response?.error || 'Could not start screen share');
-          stopLocalStream();
+          setError(response?.error || 'Could not start screen sharing.');
+          clearMedia();
           return;
         }
         setSharing(true);
-        connectToExistingViewers(stream);
       });
-    } catch {
-      setError('Screen share was blocked. Choose a screen, window, or browser tab when prompted.');
-    }
-  }, [
-    socket,
-    isHost,
-    sharing,
-    attachLocalPreview,
-    stopSharing,
-    stopLocalStream,
-    connectToExistingViewers,
-  ]);
-
-  useEffect(() => {
-    if (!socket || !isHost || !sharing || !streamRef.current) return undefined;
-
-    const onViewerReady = ({ viewerId }) => {
-      if (viewerId && streamRef.current) {
-        createHostPeer(viewerId, streamRef.current);
+    } catch (captureError) {
+      if (captureError?.name !== 'NotAllowedError') {
+        setError('Screen capture failed. Check browser permissions and try again.');
+      } else {
+        setError('Screen sharing was cancelled or blocked by the browser.');
       }
-    };
+    }
+  }, [socket, isHost, sharing, stopSharing, clearMedia]);
 
-    socket.on('webrtc:viewer-ready', onViewerReady);
-    return () => socket.off('webrtc:viewer-ready', onViewerReady);
-  }, [socket, isHost, sharing, createHostPeer]);
+  const resumePlayback = useCallback(async () => {
+    try {
+      await remoteVideoRef.current?.play();
+      setNeedsPlayback(false);
+    } catch {
+      setError('Your browser still blocked playback. Allow audio for this site and try again.');
+    }
+  }, []);
 
   useEffect(() => {
-    if (!socket || !isHost || !sharing) return undefined;
-
+    if (!socket || !isHost) return undefined;
+    const onViewerReady = ({ viewerId }) => createHostPeer(viewerId);
     const onAnswer = async ({ from, answer }) => {
       const pc = peersRef.current.get(from);
-      if (!pc || !answer) return;
-      await pc.setRemoteDescription(new RTCSessionDescription(answer));
+      if (!pc || !answer || pc.signalingState === 'closed') return;
+      try {
+        await pc.setRemoteDescription(answer);
+        const queued = pendingHostIceRef.current.get(from) || [];
+        for (const candidate of queued) await pc.addIceCandidate(candidate);
+        pendingHostIceRef.current.set(from, []);
+      } catch {
+        closePeer(from);
+      }
     };
-
     const onIce = async ({ from, candidate }) => {
       const pc = peersRef.current.get(from);
       if (!pc || !candidate) return;
-      await pc.addIceCandidate(new RTCIceCandidate(candidate));
+      if (!pc.remoteDescription) {
+        const queue = pendingHostIceRef.current.get(from) || [];
+        queue.push(candidate);
+        pendingHostIceRef.current.set(from, queue);
+        return;
+      }
+      await pc.addIceCandidate(candidate).catch(() => {});
     };
-
+    socket.on('webrtc:viewer-ready', onViewerReady);
     socket.on('webrtc:answer', onAnswer);
     socket.on('webrtc:ice-candidate', onIce);
-
     return () => {
+      socket.off('webrtc:viewer-ready', onViewerReady);
       socket.off('webrtc:answer', onAnswer);
       socket.off('webrtc:ice-candidate', onIce);
     };
-  }, [socket, isHost, sharing]);
+  }, [socket, isHost, createHostPeer, closePeer]);
 
   useEffect(() => {
     if (!socket || isHost) return undefined;
-
     const onOffer = async ({ from, offer }) => {
       if (!offer) return;
-
-      if (hostPcRef.current) {
-        hostPcRef.current.close();
-        hostPcRef.current = null;
-      }
-
-      const pc = new RTCPeerConnection(ICE_SERVERS);
+      if (hostPcRef.current) hostPcRef.current.close();
+      const pc = new RTCPeerConnection(RTC_CONFIG);
       hostPcRef.current = pc;
-
-      pc.ontrack = (event) => {
-        const [stream] = event.streams;
-        if (stream && remoteVideoRef.current) {
-          remoteVideoRef.current.srcObject = stream;
-          remoteVideoRef.current.play().catch(() => { });
-          setConnected(true);
+      pc.ontrack = async ({ streams }) => {
+        const stream = streams[0];
+        if (!stream || !remoteVideoRef.current) return;
+        remoteVideoRef.current.srcObject = stream;
+        try {
+          await remoteVideoRef.current.play();
+          setNeedsPlayback(false);
+        } catch {
+          setNeedsPlayback(true);
         }
       };
-
-      pc.onicecandidate = (event) => {
-        if (event.candidate) {
-          socket.emit('webrtc:ice-candidate', { to: from, candidate: event.candidate });
-        }
+      pc.onicecandidate = ({ candidate }) => {
+        if (candidate) socket.emit('webrtc:ice-candidate', { to: from, candidate });
       };
-
       pc.onconnectionstatechange = () => {
-        if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
-          setConnected(false);
+        setConnected(pc.connectionState === 'connected');
+        if (pc.connectionState === 'failed') {
+          setError('Could not reach the host. A TURN server may be required for this network.');
+          requestedShareRef.current = null;
+          window.setTimeout(() => socket.emit('webrtc:viewer-ready', {}), 1500);
         }
       };
-
-      await pc.setRemoteDescription(new RTCSessionDescription(offer));
-      const answer = await pc.createAnswer();
-      await pc.setLocalDescription(answer);
-      socket.emit('webrtc:answer', { to: from, answer: pc.localDescription });
+      try {
+        await pc.setRemoteDescription(offer);
+        for (const candidate of pendingViewerIceRef.current) await pc.addIceCandidate(candidate);
+        pendingViewerIceRef.current = [];
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+        socket.emit('webrtc:answer', { to: from, answer: pc.localDescription });
+      } catch {
+        setError('The screen-share connection could not be negotiated. Please retry.');
+      }
     };
-
-    const onIce = async ({ from, candidate }) => {
+    const onIce = async ({ candidate }) => {
       const pc = hostPcRef.current;
-      if (!pc || !candidate) return;
-      await pc.addIceCandidate(new RTCIceCandidate(candidate));
+      if (!candidate) return;
+      if (!pc?.remoteDescription) {
+        pendingViewerIceRef.current.push(candidate);
+        return;
+      }
+      await pc.addIceCandidate(candidate).catch(() => {});
     };
-
-    const onStarted = () => {
-      socket.emit('webrtc:viewer-ready', {});
-    };
-
     const onStopped = () => {
       cleanupPeers();
-      stopLocalStream();
+      if (remoteVideoRef.current) remoteVideoRef.current.srcObject = null;
+      requestedShareRef.current = null;
       setConnected(false);
-      setSharing(false);
+      setNeedsPlayback(false);
     };
-
     socket.on('webrtc:offer', onOffer);
     socket.on('webrtc:ice-candidate', onIce);
-    socket.on('screen:started', onStarted);
     socket.on('screen:stopped', onStopped);
-
-    if (screenShare?.active) {
-      socket.emit('webrtc:viewer-ready', {});
-    }
-
     return () => {
       socket.off('webrtc:offer', onOffer);
       socket.off('webrtc:ice-candidate', onIce);
-      socket.off('screen:started', onStarted);
       socket.off('screen:stopped', onStopped);
     };
-  }, [socket, isHost, screenShare?.active, cleanupPeers, stopLocalStream]);
+  }, [socket, isHost, cleanupPeers]);
 
   useEffect(() => {
-    if (!isHost && sharing) {
-      stopLocalStream();
-      cleanupPeers();
-      setSharing(false);
-      setConnected(false);
-    }
-  }, [isHost, sharing, stopLocalStream, cleanupPeers]);
+    if (!socket || isHost || !screenShare?.active) return;
+    const shareId = screenShare.startedAt;
+    if (requestedShareRef.current === shareId) return;
+    requestedShareRef.current = shareId;
+    socket.emit('webrtc:viewer-ready', {});
+  }, [socket, isHost, screenShare?.active, screenShare?.startedAt]);
 
-  useEffect(() => {
-    return () => {
-      stopLocalStream();
-      cleanupPeers();
-    };
-  }, [stopLocalStream, cleanupPeers]);
+  useEffect(() => () => {
+    clearMedia();
+    cleanupPeers();
+  }, [clearMedia, cleanupPeers]);
 
   return {
     localVideoRef,
     remoteVideoRef,
     sharing,
     connected,
+    needsPlayback,
     error,
     startSharing,
     stopSharing,
+    resumePlayback,
     isLive: Boolean(screenShare?.active),
   };
 }

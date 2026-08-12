@@ -35,23 +35,12 @@ const io = new Server(httpServer, {
 const rooms = new Map();
 
 /**
- * @typedef {Object} PlaybackState
- * @property {string} videoUrl
- * @property {string} videoTitle
- * @property {boolean} isPlaying
- * @property {number} currentTime
- * @property {number} playbackRate
- * @property {number} updatedAt
- */
-
-/**
  * @typedef {Object} Room
  * @property {string} id
  * @property {string} name
  * @property {string} hostId
- * @property {PlaybackState} playback
  * @property {{ active: boolean, title: string, startedAt: number | null }} screenShare
- * @property {Array<{id: string, name: string, joinedAt: number}>} members
+ * @property {Array<{id: string, name: string, joinedAt: number, voiceEnabled: boolean}>} members
  * @property {Array<{id: string, user: string, text: string, at: number}>} messages
  * @property {number} createdAt
  */
@@ -61,16 +50,8 @@ function createRoom(name) {
   /** @type {Room} */
   const room = {
     id,
-    name: name || 'Watch Party',
+    name: name || 'Screen Share Room',
     hostId: '',
-    playback: {
-      videoUrl: '',
-      videoTitle: '',
-      isPlaying: false,
-      currentTime: 0,
-      playbackRate: 1,
-      updatedAt: Date.now(),
-    },
     screenShare: {
       active: false,
       title: '',
@@ -90,11 +71,6 @@ function getPublicRoom(room) {
     name: room.name,
     hostId: room.hostId,
     memberCount: room.members.length,
-    playback: {
-      videoUrl: room.playback.videoUrl,
-      videoTitle: room.playback.videoTitle,
-      isPlaying: room.playback.isPlaying,
-    },
     screenShare: room.screenShare,
     createdAt: room.createdAt,
   };
@@ -105,17 +81,10 @@ function serializeRoom(room) {
     id: room.id,
     name: room.name,
     hostId: room.hostId,
-    playback: room.playback,
     screenShare: room.screenShare,
     members: room.members,
     messages: room.messages.slice(-100),
   };
-}
-
-function projectedTime(playback) {
-  if (!playback.isPlaying) return playback.currentTime;
-  const elapsed = (Date.now() - playback.updatedAt) / 1000;
-  return playback.currentTime + elapsed * playback.playbackRate;
 }
 
 app.get('/api/health', (_req, res) => {
@@ -170,7 +139,12 @@ io.on('connection', (socket) => {
 
     const existing = room.members.find((m) => m.id === socket.id);
     if (!existing) {
-      room.members.push({ id: socket.id, name: userName, joinedAt: Date.now() });
+      room.members.push({
+        id: socket.id,
+        name: userName,
+        joinedAt: Date.now(),
+        voiceEnabled: false,
+      });
       room.messages.push({
         id: nanoid(),
         user: 'System',
@@ -184,9 +158,6 @@ io.on('connection', (socket) => {
     ack?.({ ok: true, room: serializeRoom(room), youAreHost: room.hostId === socket.id });
     io.to(roomId).emit('room:update', serializeRoom(room));
 
-    if (room.screenShare.active && room.hostId !== socket.id) {
-      io.to(room.hostId).emit('webrtc:viewer-ready', { viewerId: socket.id });
-    }
   });
 
   socket.on('chat:send', ({ text }, ack) => {
@@ -204,58 +175,6 @@ io.on('connection', (socket) => {
     ack?.({ ok: true });
   });
 
-  socket.on('playback:load', ({ videoUrl, videoTitle }, ack) => {
-    const room = rooms.get(currentRoomId);
-    if (!room || room.hostId !== socket.id) {
-      return ack?.({ ok: false, error: 'Only the host can change the video' });
-    }
-
-    room.playback = {
-      videoUrl: videoUrl?.trim() || '',
-      videoTitle: (videoTitle || 'Untitled').trim().slice(0, 120),
-      isPlaying: false,
-      currentTime: 0,
-      playbackRate: 1,
-      updatedAt: Date.now(),
-    };
-    room.screenShare = { active: false, title: '', startedAt: null };
-
-    io.to(currentRoomId).emit('playback:load', room.playback);
-    io.to(currentRoomId).emit('screen:stopped');
-    io.to(currentRoomId).emit('room:update', serializeRoom(room));
-    ack?.({ ok: true });
-  });
-
-  socket.on('playback:sync', (payload, ack) => {
-    const room = rooms.get(currentRoomId);
-    if (!room || room.hostId !== socket.id) {
-      return ack?.({ ok: false, error: 'Only the host controls playback' });
-    }
-
-    const { isPlaying, currentTime, playbackRate = 1 } = payload;
-    room.playback = {
-      ...room.playback,
-      isPlaying: Boolean(isPlaying),
-      currentTime: Math.max(0, Number(currentTime) || 0),
-      playbackRate: Math.min(2, Math.max(0.25, Number(playbackRate) || 1)),
-      updatedAt: Date.now(),
-    };
-
-    io.to(currentRoomId).emit('playback:sync', room.playback);
-    ack?.({ ok: true });
-  });
-
-  socket.on('playback:request-state', (_payload, ack) => {
-    const room = rooms.get(currentRoomId);
-    if (!room) return ack?.({ ok: false });
-
-    const projected = projectedTime(room.playback);
-    ack?.({
-      ok: true,
-      playback: { ...room.playback, currentTime: projected },
-    });
-  });
-
   socket.on('screen:start', ({ title }, ack) => {
     const room = rooms.get(currentRoomId);
     if (!room || room.hostId !== socket.id) {
@@ -267,15 +186,6 @@ io.on('connection', (socket) => {
       title: (title || 'Live screen share').trim().slice(0, 120),
       startedAt: Date.now(),
     };
-    room.playback = {
-      ...room.playback,
-      videoUrl: '',
-      videoTitle: '',
-      isPlaying: false,
-      currentTime: 0,
-      updatedAt: Date.now(),
-    };
-
     io.to(currentRoomId).emit('screen:started', room.screenShare);
     io.to(currentRoomId).emit('room:update', serializeRoom(room));
     ack?.({ ok: true });
@@ -293,25 +203,42 @@ io.on('connection', (socket) => {
     ack?.({ ok: true });
   });
 
-  socket.on('webrtc:offer', ({ to, offer }) => {
-    if (!to || !offer) return;
-    io.to(to).emit('webrtc:offer', { from: socket.id, offer });
-  });
+  const relayToRoomMember = (eventName, payload, field) => {
+    const room = rooms.get(currentRoomId);
+    const targetId = payload?.to;
+    if (!room || !targetId || !room.members.some((member) => member.id === targetId)) return;
+    if (!payload[field]) return;
+    io.to(targetId).emit(eventName, { from: socket.id, [field]: payload[field] });
+  };
 
-  socket.on('webrtc:answer', ({ to, answer }) => {
-    if (!to || !answer) return;
-    io.to(to).emit('webrtc:answer', { from: socket.id, answer });
-  });
-
-  socket.on('webrtc:ice-candidate', ({ to, candidate }) => {
-    if (!to || !candidate) return;
-    io.to(to).emit('webrtc:ice-candidate', { from: socket.id, candidate });
+  socket.on('webrtc:offer', (payload) => relayToRoomMember('webrtc:offer', payload, 'offer'));
+  socket.on('webrtc:answer', (payload) => relayToRoomMember('webrtc:answer', payload, 'answer'));
+  socket.on('webrtc:ice-candidate', (payload) => {
+    relayToRoomMember('webrtc:ice-candidate', payload, 'candidate');
   });
 
   socket.on('webrtc:viewer-ready', () => {
     const room = rooms.get(currentRoomId);
     if (!room?.screenShare.active || room.hostId === socket.id) return;
     io.to(room.hostId).emit('webrtc:viewer-ready', { viewerId: socket.id });
+  });
+
+  socket.on('voice:state', ({ enabled }, ack) => {
+    const room = rooms.get(currentRoomId);
+    const member = room?.members.find((entry) => entry.id === socket.id);
+    if (!room || !member) return ack?.({ ok: false });
+    member.voiceEnabled = Boolean(enabled);
+    io.to(currentRoomId).emit('room:update', serializeRoom(room));
+    ack?.({ ok: true });
+  });
+
+  socket.on('voice:signal', ({ to, type, data }) => {
+    const room = rooms.get(currentRoomId);
+    const sender = room?.members.find((member) => member.id === socket.id);
+    const target = room?.members.find((member) => member.id === to);
+    if (!room || !sender?.voiceEnabled || !target?.voiceEnabled) return;
+    if (!['offer', 'answer', 'ice'].includes(type) || !data) return;
+    io.to(to).emit('voice:signal', { from: socket.id, type, data });
   });
 
   socket.on('host:transfer', ({ targetId }, ack) => {
@@ -349,7 +276,8 @@ io.on('connection', (socket) => {
       return;
     }
 
-    if (room.hostId === socket.id) {
+    const hostLeft = room.hostId === socket.id;
+    if (hostLeft) {
       room.hostId = room.members[0].id;
       room.screenShare = { active: false, title: '', startedAt: null };
       room.messages.push({
@@ -367,7 +295,7 @@ io.on('connection', (socket) => {
       at: Date.now(),
     });
 
-    io.to(currentRoomId).emit('screen:stopped');
+    if (hostLeft) io.to(currentRoomId).emit('screen:stopped');
     io.to(currentRoomId).emit('room:update', serializeRoom(room));
   });
 });

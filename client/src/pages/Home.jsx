@@ -27,7 +27,7 @@ export default function Home() {
     setLoading(true);
     setError('');
     try {
-      const room = await createRoom(roomName.trim() || 'Watch Party');
+      const room = await createRoom(roomName.trim() || 'Screen Share Room');
       navigate(`/room/${room.id}`, { state: { name: displayName } });
     } catch {
       setError('Could not create a room. Make sure the server is running.');
@@ -56,12 +56,12 @@ export default function Home() {
           <div className="brand-mark">SV</div>
           <div>
             <h1>SyncView</h1>
-            <p>Watch together, stay in sync</p>
+            <p>Share your screen, talk together</p>
           </div>
         </div>
 
         <p className="hero-copy">
-          Create a room, share the link with friends, and watch together — share your screen for Netflix and YouTube, or sync direct video links.
+          Create a private room, broadcast your screen, and stay connected with live voice and text chat.
         </p>
 
         <div className="form-stack">
@@ -88,7 +88,7 @@ export default function Home() {
           </div>
 
           <button className="btn btn-primary" onClick={handleCreate} disabled={loading}>
-            {loading ? 'Creating…' : 'Create watch party'}
+            {loading ? 'Creating…' : 'Create room'}
           </button>
 
           <div className="field">
@@ -109,10 +109,10 @@ export default function Home() {
         {error && <div className="error-banner">{error}</div>}
 
         <ul className="feature-list">
-          <li>Share your screen — Netflix, YouTube, anything</li>
-          <li>Real-time play, pause, and seek sync for video URLs</li>
+          <li>Low-latency screen sharing</li>
+          <li>Live voice chat with mute controls</li>
           <li>Shareable room links for friends</li>
-          <li>Live chat while you watch</li>
+          <li>Text chat and host controls</li>
         </ul>
       </section>
     </main>

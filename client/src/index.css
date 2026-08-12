@@ -285,6 +285,17 @@ a {
   gap: 1rem;
 }
 
+.media-column {
+  display: grid;
+  gap: 1rem;
+  align-content: start;
+}
+
+.header-actions {
+  display: flex;
+  gap: 0.65rem;
+}
+
 @media (max-width: 980px) {
   .room-body {
     grid-template-columns: 1fr;
@@ -480,28 +491,6 @@ a {
   gap: 0.35rem;
 }
 
-.source-tabs {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 0.5rem;
-  margin-bottom: 0.75rem;
-}
-
-.source-tab {
-  border: 1px solid var(--border);
-  background: var(--bg-elevated);
-  color: var(--text-muted);
-  border-radius: 10px;
-  padding: 0.7rem 1rem;
-  font-weight: 600;
-}
-
-.source-tab.active {
-  color: var(--text);
-  border-color: rgba(124, 92, 255, 0.45);
-  background: var(--accent-soft);
-}
-
 .pill-live {
   color: #ffc9c9;
   border-color: rgba(255, 107, 107, 0.35);
@@ -549,6 +538,14 @@ a {
   background: rgba(0, 0, 0, 0.55);
 }
 
+.playback-gate {
+  z-index: 2;
+}
+
+.playback-gate p {
+  margin: 0.35rem 0 1rem;
+}
+
 .screen-error {
   margin: 0 1rem 1rem;
 }
@@ -571,4 +568,70 @@ a {
 
 .screen-tips li + li {
   margin-top: 0.35rem;
+}
+
+.voice-panel {
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 1rem;
+  display: grid;
+  gap: 0.85rem;
+}
+
+.voice-summary,
+.voice-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.65rem;
+}
+
+.voice-summary {
+  justify-content: space-between;
+}
+
+.voice-summary > div {
+  display: grid;
+}
+
+.voice-summary span,
+.voice-panel small,
+.voice-empty {
+  color: var(--text-muted);
+  font-size: 0.85rem;
+}
+
+.voice-people {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+}
+
+.voice-person {
+  padding: 0.3rem 0.6rem;
+  border-radius: 999px;
+  border: 1px solid rgba(61, 214, 140, 0.25);
+  background: rgba(61, 214, 140, 0.08);
+  color: #b9f6d7;
+  font-size: 0.82rem;
+}
+
+@media (max-width: 640px) {
+  .room-header-inner {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .header-actions {
+    width: 100%;
+  }
+
+  .header-actions .btn {
+    flex: 1;
+    text-align: center;
+  }
+
+  .hero-card {
+    padding: 1.5rem;
+  }
 }
