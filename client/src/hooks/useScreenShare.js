@@ -103,14 +103,36 @@ export function useScreenShare({ socket, isHost, screenShare }) {
   const startSharing = useCallback(async () => {
     if (!socket || !isHost || sharing) return;
     setError('');
+
+    if (!window.isSecureContext) {
+      setError('Screen sharing requires HTTPS. Open the secure https:// version of this site.');
+      return;
+    }
+
+    if (!navigator.mediaDevices?.getDisplayMedia) {
+      setError('This browser does not support screen sharing. Try the latest Chrome, Edge, or Firefox on a computer.');
+      return;
+    }
+
     try {
-      const stream = await navigator.mediaDevices.getDisplayMedia({
-        video: { frameRate: { ideal: 30, max: 60 } },
-        audio: true,
-        preferCurrentTab: true,
-        selfBrowserSurface: 'exclude',
-        systemAudio: 'include',
-      });
+      let stream;
+      try {
+        stream = await navigator.mediaDevices.getDisplayMedia({
+          video: { frameRate: { ideal: 30 } },
+          audio: true,
+          preferCurrentTab: true,
+          selfBrowserSurface: 'exclude',
+          systemAudio: 'include',
+        });
+      } catch (captureError) {
+        // Some browsers reject newer display-capture hints instead of ignoring them.
+        // Retry with the baseline standard constraints so their native picker opens.
+        if (['TypeError', 'OverconstrainedError'].includes(captureError?.name)) {
+          stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
+        } else {
+          throw captureError;
+        }
+      }
       streamRef.current = stream;
       if (localVideoRef.current) {
         localVideoRef.current.srcObject = stream;
@@ -128,11 +150,15 @@ export function useScreenShare({ socket, isHost, screenShare }) {
         setSharing(true);
       });
     } catch (captureError) {
-      if (captureError?.name !== 'NotAllowedError') {
-        setError('Screen capture failed. Check browser permissions and try again.');
-      } else {
-        setError('Screen sharing was cancelled or blocked by the browser.');
-      }
+      const errorName = captureError?.name || 'UnknownError';
+      const messages = {
+        NotAllowedError: 'Screen sharing was cancelled or blocked. Check the site permissions, then click Share my screen again.',
+        NotFoundError: 'No shareable screen or window was found. Check your operating-system screen-recording permission.',
+        NotReadableError: 'The browser could not capture the selected screen. Close other screen-recording apps and try again.',
+        AbortError: 'The browser stopped screen selection before it completed. Please try again.',
+        InvalidStateError: 'Screen sharing must be started from this button in the active browser tab. Focus this tab and try again.',
+      };
+      setError(messages[errorName] || `Screen capture failed (${errorName}). Try Chrome or Edge and check browser screen-sharing permissions.`);
     }
   }, [socket, isHost, sharing, stopSharing, clearMedia]);
 
