@@ -13,6 +13,23 @@ const RTC_CONFIG = {
   ],
 };
 
+async function tuneVoiceSender(sender) {
+  if (sender.track?.kind !== 'audio') return;
+  sender.track.contentHint = 'speech';
+  const parameters = sender.getParameters();
+  if (!parameters.encodings?.length) parameters.encodings = [{}];
+  parameters.encodings[0].maxBitrate = 64_000;
+  parameters.encodings[0].priority = 'high';
+  parameters.encodings[0].networkPriority = 'high';
+  try {
+    await sender.setParameters(parameters);
+  } catch {
+    delete parameters.encodings[0].priority;
+    delete parameters.encodings[0].networkPriority;
+    await sender.setParameters(parameters).catch(() => {});
+  }
+}
+
 export function useVoiceChat({ socket, members = [] }) {
   const streamRef = useRef(null);
   const peersRef = useRef(new Map());
@@ -105,7 +122,10 @@ export function useVoiceChat({ socket, members = [] }) {
     const pc = new RTCPeerConnection(RTC_CONFIG);
     peersRef.current.set(peerId, pc);
     if (!pendingIceRef.current.has(peerId)) pendingIceRef.current.set(peerId, []);
-    streamRef.current.getTracks().forEach((track) => pc.addTrack(track, streamRef.current));
+    streamRef.current.getTracks().forEach((track) => {
+      const sender = pc.addTrack(track, streamRef.current);
+      tuneVoiceSender(sender);
+    });
 
     pc.onicecandidate = ({ candidate }) => {
       if (candidate) socket.emit('voice:signal', { to: peerId, type: 'ice', data: candidate });
@@ -154,6 +174,10 @@ export function useVoiceChat({ socket, members = [] }) {
           echoCancellation: true,
           noiseSuppression: true,
           autoGainControl: true,
+          channelCount: 1,
+          sampleRate: 48000,
+          sampleSize: 16,
+          latency: { ideal: 0.02 },
         },
         video: false,
       });

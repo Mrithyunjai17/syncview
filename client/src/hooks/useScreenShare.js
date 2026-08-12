@@ -14,12 +14,13 @@ function getIceServers() {
 }
 
 const RTC_CONFIG = getIceServers();
-const TARGET_WIDTH = 1280;
-const TARGET_HEIGHT = 720;
-const TARGET_FPS = 30;
-const TOTAL_VIDEO_BUDGET = 5_000_000;
+export const SCREEN_QUALITY_PROFILES = {
+  smooth: { label: 'Smooth · 540p', width: 960, height: 540, fps: 24, peerBitrate: 1_400_000, totalBitrate: 3_500_000 },
+  balanced: { label: 'Balanced · 720p', width: 1280, height: 720, fps: 30, peerBitrate: 2_500_000, totalBitrate: 5_000_000 },
+  high: { label: 'High · 1080p', width: 1920, height: 1080, fps: 30, peerBitrate: 4_000_000, totalBitrate: 8_000_000 },
+};
 
-async function tuneSender(sender, peerCount) {
+async function tuneSender(sender, peerCount, profile) {
   const track = sender.track;
   if (!track) return;
   const parameters = sender.getParameters();
@@ -29,21 +30,29 @@ async function tuneSender(sender, peerCount) {
     const settings = track.getSettings();
     const scale = Math.max(
       1,
-      (settings.width || TARGET_WIDTH) / TARGET_WIDTH,
-      (settings.height || TARGET_HEIGHT) / TARGET_HEIGHT,
+      (settings.width || profile.width) / profile.width,
+      (settings.height || profile.height) / profile.height,
     );
     parameters.degradationPreference = 'maintain-framerate';
     parameters.encodings[0].maxBitrate = Math.max(
-      900_000,
-      Math.min(2_500_000, Math.floor(TOTAL_VIDEO_BUDGET / Math.max(1, peerCount))),
+      700_000,
+      Math.min(profile.peerBitrate, Math.floor(profile.totalBitrate / Math.max(1, peerCount))),
     );
-    parameters.encodings[0].maxFramerate = TARGET_FPS;
+    parameters.encodings[0].maxFramerate = profile.fps;
     parameters.encodings[0].scaleResolutionDownBy = scale;
   } else if (track.kind === 'audio') {
-    parameters.encodings[0].maxBitrate = 128_000;
+    parameters.encodings[0].maxBitrate = 160_000;
+    parameters.encodings[0].priority = 'high';
+    parameters.encodings[0].networkPriority = 'high';
   }
 
-  await sender.setParameters(parameters).catch(() => {});
+  try {
+    await sender.setParameters(parameters);
+  } catch {
+    delete parameters.encodings[0].priority;
+    delete parameters.encodings[0].networkPriority;
+    await sender.setParameters(parameters).catch(() => {});
+  }
 }
 
 export function useScreenShare({ socket, isHost, screenShare }) {
@@ -56,16 +65,19 @@ export function useScreenShare({ socket, isHost, screenShare }) {
   const pendingViewerIceRef = useRef([]);
   const requestedShareRef = useRef(null);
   const stoppingRef = useRef(false);
+  const qualityRef = useRef('balanced');
 
   const [sharing, setSharing] = useState(false);
   const [connected, setConnected] = useState(false);
   const [needsPlayback, setNeedsPlayback] = useState(false);
   const [error, setError] = useState('');
+  const [quality, setQualityState] = useState('balanced');
 
   const rebalanceHostSenders = useCallback(() => {
     const peerCount = peersRef.current.size;
     peersRef.current.forEach((pc) => {
-      pc.getSenders().forEach((sender) => tuneSender(sender, peerCount));
+      const profile = SCREEN_QUALITY_PROFILES[qualityRef.current];
+      pc.getSenders().forEach((sender) => tuneSender(sender, peerCount, profile));
     });
   }, []);
 
@@ -119,7 +131,8 @@ export function useScreenShare({ socket, isHost, screenShare }) {
     peersRef.current.set(viewerId, pc);
     pendingHostIceRef.current.set(viewerId, []);
     const senders = stream.getTracks().map((track) => pc.addTrack(track, stream));
-    await Promise.all(senders.map((sender) => tuneSender(sender, peersRef.current.size)));
+    const profile = SCREEN_QUALITY_PROFILES[qualityRef.current];
+    await Promise.all(senders.map((sender) => tuneSender(sender, peersRef.current.size, profile)));
     rebalanceHostSenders();
 
     pc.onicecandidate = ({ candidate }) => {
@@ -141,6 +154,22 @@ export function useScreenShare({ socket, isHost, screenShare }) {
     }
   }, [socket, closePeer, rebalanceHostSenders]);
 
+  const setQuality = useCallback(async (nextQuality) => {
+    const profile = SCREEN_QUALITY_PROFILES[nextQuality];
+    if (!profile) return;
+    qualityRef.current = nextQuality;
+    setQualityState(nextQuality);
+    const videoTrack = streamRef.current?.getVideoTracks()[0];
+    if (videoTrack) {
+      await videoTrack.applyConstraints({
+        width: { ideal: profile.width, max: profile.width },
+        height: { ideal: profile.height, max: profile.height },
+        frameRate: { ideal: profile.fps, max: profile.fps },
+      }).catch(() => {});
+      rebalanceHostSenders();
+    }
+  }, [rebalanceHostSenders]);
+
   const startSharing = useCallback(async () => {
     if (!socket || !isHost || sharing) return;
     setError('');
@@ -156,13 +185,14 @@ export function useScreenShare({ socket, isHost, screenShare }) {
     }
 
     try {
+      const profile = SCREEN_QUALITY_PROFILES[qualityRef.current];
       let stream;
       try {
         stream = await navigator.mediaDevices.getDisplayMedia({
           video: {
-            width: { ideal: TARGET_WIDTH, max: 1920 },
-            height: { ideal: TARGET_HEIGHT, max: 1080 },
-            frameRate: { ideal: TARGET_FPS, max: TARGET_FPS },
+            width: { ideal: profile.width, max: profile.width },
+            height: { ideal: profile.height, max: profile.height },
+            frameRate: { ideal: profile.fps, max: profile.fps },
           },
           audio: true,
           preferCurrentTab: true,
@@ -182,11 +212,13 @@ export function useScreenShare({ socket, isHost, screenShare }) {
       if (videoTrack) {
         videoTrack.contentHint = 'motion';
         await videoTrack.applyConstraints({
-          width: { ideal: TARGET_WIDTH, max: 1920 },
-          height: { ideal: TARGET_HEIGHT, max: 1080 },
-          frameRate: { ideal: TARGET_FPS, max: TARGET_FPS },
+          width: { ideal: profile.width, max: profile.width },
+          height: { ideal: profile.height, max: profile.height },
+          frameRate: { ideal: profile.fps, max: profile.fps },
         }).catch(() => {});
       }
+      const audioTrack = stream.getAudioTracks()[0];
+      if (audioTrack) audioTrack.contentHint = 'music';
       streamRef.current = stream;
       if (localVideoRef.current) {
         localVideoRef.current.srcObject = stream;
@@ -346,9 +378,12 @@ export function useScreenShare({ socket, isHost, screenShare }) {
     connected,
     needsPlayback,
     error,
+    quality,
+    qualityProfiles: SCREEN_QUALITY_PROFILES,
     startSharing,
     stopSharing,
     resumePlayback,
+    setQuality,
     isLive: Boolean(screenShare?.active),
   };
 }
