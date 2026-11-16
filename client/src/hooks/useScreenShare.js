@@ -1,19 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { RTC_CONFIG } from '../rtcConfig.js';
 
-function getIceServers() {
-  const iceServers = [{ urls: 'stun:stun.l.google.com:19302' }];
-  const turnUrl = import.meta.env.VITE_TURN_URL;
-  if (turnUrl) {
-    iceServers.push({
-      urls: turnUrl.split(',').map((url) => url.trim()),
-      username: import.meta.env.VITE_TURN_USERNAME || '',
-      credential: import.meta.env.VITE_TURN_CREDENTIAL || '',
-    });
-  }
-  return { iceServers };
-}
+const MAX_VIEWER_RETRIES = 3;
 
-const RTC_CONFIG = getIceServers();
 export const SCREEN_QUALITY_PROFILES = {
   smooth: { label: 'Smooth · 540p', width: 960, height: 540, fps: 24, peerBitrate: 1_400_000, totalBitrate: 3_500_000 },
   balanced: { label: 'Balanced · 720p', width: 1280, height: 720, fps: 30, peerBitrate: 2_500_000, totalBitrate: 5_000_000 },
@@ -66,6 +55,8 @@ export function useScreenShare({ socket, isHost, screenShare }) {
   const requestedShareRef = useRef(null);
   const stoppingRef = useRef(false);
   const qualityRef = useRef('balanced');
+  const viewerRetriesRef = useRef(0);
+  const retryTimerRef = useRef(null);
 
   const [sharing, setSharing] = useState(false);
   const [connected, setConnected] = useState(false);
@@ -314,11 +305,24 @@ export function useScreenShare({ socket, isHost, screenShare }) {
         if (candidate) socket.emit('webrtc:ice-candidate', { to: from, candidate });
       };
       pc.onconnectionstatechange = () => {
+        if (hostPcRef.current !== pc) return;
         setConnected(pc.connectionState === 'connected');
+        if (pc.connectionState === 'connected') {
+          viewerRetriesRef.current = 0;
+          setError('');
+        }
         if (pc.connectionState === 'failed') {
-          setError('Could not reach the host. A TURN server may be required for this network.');
-          requestedShareRef.current = null;
-          window.setTimeout(() => socket.emit('webrtc:viewer-ready', {}), 1500);
+          if (viewerRetriesRef.current >= MAX_VIEWER_RETRIES) {
+            setError('Could not reach the host after several attempts. A TURN server may be required for this network.');
+            return;
+          }
+          viewerRetriesRef.current += 1;
+          setError('Could not reach the host. Retrying…');
+          window.clearTimeout(retryTimerRef.current);
+          retryTimerRef.current = window.setTimeout(
+            () => socket.emit('webrtc:viewer-ready', {}),
+            1500 * viewerRetriesRef.current,
+          );
         }
       };
       try {
@@ -342,6 +346,8 @@ export function useScreenShare({ socket, isHost, screenShare }) {
       await pc.addIceCandidate(candidate).catch(() => {});
     };
     const onStopped = () => {
+      window.clearTimeout(retryTimerRef.current);
+      viewerRetriesRef.current = 0;
       cleanupPeers();
       if (remoteVideoRef.current) remoteVideoRef.current.srcObject = null;
       requestedShareRef.current = null;
@@ -363,10 +369,23 @@ export function useScreenShare({ socket, isHost, screenShare }) {
     const shareId = screenShare.startedAt;
     if (requestedShareRef.current === shareId) return;
     requestedShareRef.current = shareId;
+    viewerRetriesRef.current = 0;
     socket.emit('webrtc:viewer-ready', {});
   }, [socket, isHost, screenShare?.active, screenShare?.startedAt]);
 
+  // Losing the host role (transfer or server reassignment) must end any local capture.
+  // stopSharing() is host-only and would also emit screen:stop, which the server now rejects.
+  useEffect(() => {
+    if (isHost || !streamRef.current) return;
+    clearMedia();
+    cleanupPeers();
+    setSharing(false);
+    setConnected(false);
+    stoppingRef.current = false;
+  }, [isHost, clearMedia, cleanupPeers]);
+
   useEffect(() => () => {
+    window.clearTimeout(retryTimerRef.current);
     clearMedia();
     cleanupPeers();
   }, [clearMedia, cleanupPeers]);

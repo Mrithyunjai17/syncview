@@ -1,17 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-
-const RTC_CONFIG = {
-  iceServers: [
-    { urls: 'stun:stun.l.google.com:19302' },
-    ...(import.meta.env.VITE_TURN_URL
-      ? [{
-          urls: import.meta.env.VITE_TURN_URL.split(',').map((url) => url.trim()),
-          username: import.meta.env.VITE_TURN_USERNAME || '',
-          credential: import.meta.env.VITE_TURN_CREDENTIAL || '',
-        }]
-      : []),
-  ],
-};
+import { RTC_CONFIG } from '../rtcConfig.js';
 
 async function tuneVoiceSender(sender) {
   if (sender.track?.kind !== 'audio') return;
