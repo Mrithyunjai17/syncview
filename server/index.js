@@ -21,6 +21,8 @@ function getCorsOrigin() {
 const corsOrigin = getCorsOrigin();
 
 const app = express();
+// Behind Render's proxy, req.ip must come from X-Forwarded-For for per-client rate limiting.
+if (isProd) app.set('trust proxy', 1);
 app.use(cors({ origin: corsOrigin }));
 app.use(express.json());
 
@@ -33,6 +35,54 @@ const io = new Server(httpServer, {
 
 /** @type {Map<string, Room>} */
 const rooms = new Map();
+
+/** How long a room that nobody has joined yet is kept. */
+const UNJOINED_ROOM_TTL_MS = 10 * 60 * 1000;
+/** How long an emptied room survives so a refresh/reconnect can rejoin it. */
+const EMPTY_ROOM_GRACE_MS = 60 * 1000;
+
+/** Room timers live outside the room object so they are never serialized. */
+const roomCleanupTimers = new Map();
+
+function cancelRoomCleanup(roomId) {
+  clearTimeout(roomCleanupTimers.get(roomId));
+  roomCleanupTimers.delete(roomId);
+}
+
+function scheduleRoomCleanup(roomId, delayMs) {
+  cancelRoomCleanup(roomId);
+  const timer = setTimeout(() => {
+    roomCleanupTimers.delete(roomId);
+    const room = rooms.get(roomId);
+    if (room && room.members.length === 0) rooms.delete(roomId);
+  }, delayMs);
+  timer.unref?.();
+  roomCleanupTimers.set(roomId, timer);
+}
+
+const ROOM_CREATE_WINDOW_MS = 10 * 60 * 1000;
+const ROOM_CREATE_LIMIT = 20;
+/** @type {Map<string, { count: number, resetAt: number }>} */
+const roomCreateBuckets = new Map();
+
+function allowRoomCreate(ip) {
+  const now = Date.now();
+  const bucket = roomCreateBuckets.get(ip);
+  if (!bucket || bucket.resetAt <= now) {
+    roomCreateBuckets.set(ip, { count: 1, resetAt: now + ROOM_CREATE_WINDOW_MS });
+    return true;
+  }
+  if (bucket.count >= ROOM_CREATE_LIMIT) return false;
+  bucket.count += 1;
+  return true;
+}
+
+setInterval(() => {
+  const now = Date.now();
+  roomCreateBuckets.forEach((bucket, ip) => {
+    if (bucket.resetAt <= now) roomCreateBuckets.delete(ip);
+  });
+}, ROOM_CREATE_WINDOW_MS).unref();
 
 /**
  * @typedef {Object} Room
@@ -62,6 +112,7 @@ function createRoom(name) {
     createdAt: Date.now(),
   };
   rooms.set(id, room);
+  scheduleRoomCleanup(id, UNJOINED_ROOM_TTL_MS);
   return room;
 }
 
@@ -92,6 +143,9 @@ app.get('/api/health', (_req, res) => {
 });
 
 app.post('/api/rooms', (req, res) => {
+  if (!allowRoomCreate(req.ip || 'unknown')) {
+    return res.status(429).json({ error: 'Too many rooms created. Please wait a few minutes.' });
+  }
   const room = createRoom(req.body?.name);
   res.json(getPublicRoom(room));
 });
@@ -134,6 +188,7 @@ io.on('connection', (socket) => {
     userName = (name || 'Guest').trim().slice(0, 24) || 'Guest';
     currentRoomId = roomId;
     socket.join(roomId);
+    cancelRoomCleanup(roomId);
 
     if (!room.hostId) room.hostId = socket.id;
 
@@ -287,7 +342,11 @@ io.on('connection', (socket) => {
     room.members = room.members.filter((m) => m.id !== socket.id);
 
     if (room.members.length === 0) {
-      rooms.delete(currentRoomId);
+      // Keep the room briefly so a refresh or network blip can rejoin it.
+      // The next person to join becomes host.
+      room.hostId = '';
+      room.screenShare = { active: false, title: '', startedAt: null };
+      scheduleRoomCleanup(currentRoomId, EMPTY_ROOM_GRACE_MS);
       return;
     }
 
