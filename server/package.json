@@ -8,8 +8,9 @@
   },
   "dependencies": {
     "cors": "^2.8.5",
+    "dotenv": "^18.0.10",
     "express": "^4.21.2",
-    "nanoid": "^5.1.0",
-    "socket.io": "^4.8.1"
+    "livekit-server-sdk": "^2.20.0",
+    "nanoid": "^5.1.0"
   }
 }

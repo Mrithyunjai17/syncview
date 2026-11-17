@@ -1,138 +1,66 @@
-# Deploy SyncView Online
+# Deploy SyncView
 
-Right now the app only runs on your PC (`localhost`). To use it from your phone, a friend's laptop, or anywhere else, you need to publish it on a public server with **HTTPS** (required for screen sharing).
+SyncView has two parts in production:
 
-The easiest free option is **[Render](https://render.com)** — it supports WebSockets (needed for chat and sync) and gives you a public URL like `https://syncview-xxxx.onrender.com`.
+1. **LiveKit Cloud** carries the video, audio and chat. It is free to start.
+2. **The Node app** (this repo) serves the website and issues join tokens. Render's free tier works.
 
----
-
-## Step 1 — Put the code on GitHub
-
-Render deploys from GitHub. If you don't have a repo yet:
-
-1. Create a free account at [github.com](https://github.com)
-2. Click **New repository** → name it `syncview` → **Create repository**
-3. In a terminal, from your project folder:
-
-```powershell
-cd "C:\Users\mrith\OneDrive\Desktop\Practice\Online Viewing"
-git init
-git add .
-git commit -m "Initial SyncView screen sharing app"
-git branch -M main
-git remote add origin https://github.com/YOUR_USERNAME/syncview.git
-git push -u origin main
-```
-
-Replace `YOUR_USERNAME` with your GitHub username.
+Screen sharing requires HTTPS, which Render provides automatically.
 
 ---
 
-## Step 2 — Deploy on Render
+## Step 1: Create a LiveKit Cloud project
 
-1. Sign up at [render.com](https://render.com) (use **Sign in with GitHub**)
-2. Click **New +** → **Web Service**
-3. Connect your `syncview` GitHub repository
-4. Use these settings:
+1. Sign up at https://cloud.livekit.io and create a project.
+2. Go to **Settings → Keys** and create an API key. Note three values:
+   - **URL**, like `wss://my-app-abc123.livekit.cloud`
+   - **API key**
+   - **API secret**
+
+Keep the secret private. It only goes into the server's environment, never into the client or git.
+
+## Step 2: Deploy on Render
+
+The repo includes a `render.yaml`, so Render can configure itself.
+
+1. Sign in at https://render.com with GitHub.
+2. Click **New + → Blueprint** and pick the `syncview` repository.
+3. When Render asks for the environment values, enter `LIVEKIT_URL`, `LIVEKIT_API_KEY` and `LIVEKIT_API_SECRET` from step 1.
+4. Click **Apply**. After a few minutes you get a URL like `https://syncview.onrender.com`.
+
+**Manual alternative:** create a **Web Service** instead, with:
 
 | Setting | Value |
-|---------|--------|
-| **Name** | `syncview` (or anything you like) |
-| **Region** | Pick the closest to you |
-| **Branch** | `main` |
-| **Runtime** | `Node` |
-| **Build Command** | `npm run install:all && npm run build` |
-| **Start Command** | `npm start` |
-| **Plan** | Free |
+|---|---|
+| Build Command | `npm run install:all && npm run build` |
+| Start Command | `npm start` |
+| Health Check Path | `/api/health` |
+| Environment | `NODE_ENV=production`, plus the three `LIVEKIT_*` values |
 
-5. Under **Environment**, add:
+## Step 3: Check it
 
-| Key | Value |
-|-----|--------|
-| `NODE_ENV` | `production` |
+Open `https://<your-app>.onrender.com/api/health`. It should say `"livekit": true`. Then create a room and open the invite link on another device.
 
-6. Click **Create Web Service**
+To run the API smoke test against the live site:
 
-Render will build and deploy. After 2–5 minutes you'll get a URL like:
-
-`https://syncview.onrender.com`
-
-Open that link on **any device** — phone, tablet, another PC — and it works.
-
----
-
-## Step 3 — Share with friends
-
-1. Open your public URL
-2. Create a screen sharing room
-3. Copy the invite link — it will use your public domain automatically
-4. Send it to friends; they join from anywhere
-
----
-
-## Test production locally first (optional)
-
-Before deploying, you can simulate production on your machine:
-
-```powershell
-cd "C:\Users\mrith\OneDrive\Desktop\Practice\Online Viewing"
-npm run install:all
-npm run build
-$env:NODE_ENV="production"; npm start
+```bash
+TEST_URL=https://<your-app>.onrender.com npm run test:smoke
 ```
 
-Open http://localhost:3001 — the built app is served from one port, same as production.
-
 ---
 
-## Free tier notes (Render)
+## Notes
 
-- The app **spins down after ~15 minutes** of no use. The first visit after that may take 30–60 seconds to wake up.
-- Free tier is fine for watching with friends occasionally.
-- For always-on hosting, upgrade to a paid plan (~$7/month on Render).
-
----
-
-## Other hosting options
-
-Same build/start commands work on:
-
-| Platform | Notes |
-|----------|--------|
-| [Railway](https://railway.app) | Easy GitHub deploy, limited free credits |
-| [Fly.io](https://fly.io) | Good WebSocket support, CLI-based |
-| VPS (DigitalOcean, etc.) | More control, you manage Node + HTTPS yourself |
-
-Build command: `npm run install:all && npm run build`  
-Start command: `npm start`  
-Environment: `NODE_ENV=production`
-
----
+- **Render free tier sleeps** after about 15 minutes without traffic. The first visit then takes 30–60 seconds. Rooms live in LiveKit, so a sleeping server doesn't lose them, but nobody can *join* until it wakes.
+- **LiveKit Cloud free tier** has a monthly allowance of participant-minutes and bandwidth, which is plenty for occasional watch parties with a few friends. Check usage in the LiveKit dashboard.
+- **Other hosts** (Railway, Fly.io, a VPS) work the same way: same build and start commands, same environment variables.
 
 ## Troubleshooting
 
-**Screen share doesn't work**  
-→ You must use **HTTPS**. Localhost works for dev; public URL must be `https://...`
-
-**Friends can't connect to the stream**  
-→ Some networks block WebRTC. Try again on Wi‑Fi vs mobile data. A TURN server can help (advanced).
-
-**"Room not found" after server restart**  
-→ Rooms are stored in memory. If Render restarts or sleeps, active rooms are cleared. Create a new room.
-
-**Cold start is slow**  
-→ Normal on Render free tier. Wait a minute and refresh.
-
----
-
-## Quick alternative: ngrok (temporary testing only)
-
-If you want to test from another device **without** full deployment:
-
-```powershell
-npm run dev
-# In another terminal:
-ngrok http 5173
-```
-
-This gives a temporary public URL, but it's not ideal for regular use — the URL changes and you'd need to proxy both ports. **Render is the better long-term solution.**
+| Symptom | Fix |
+|---|---|
+| "The server is missing its LiveKit settings" | One of the `LIVEKIT_*` variables is missing. Set it and redeploy. |
+| "Could not reach the media server" | The URL, key or secret is wrong, or the LiveKit project is paused. Check them in the LiveKit dashboard. |
+| Share button disabled | The page isn't on HTTPS, or the browser can't share (phones can't). |
+| Viewers see video but no sound | The sharer must pick a **tab** and keep **Share tab audio** on. Window and full-screen shares only carry audio on some systems. |
+| Black screen for a streaming site | That site blocks capture with DRM. Nothing can get around this. |

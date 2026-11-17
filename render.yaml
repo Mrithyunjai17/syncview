@@ -5,7 +5,14 @@ services:
     plan: free
     buildCommand: npm run install:all && npm run build
     startCommand: npm start
+    healthCheckPath: /api/health
     envVars:
       - key: NODE_ENV
         value: production
-    healthCheckPath: /api/health
+      # Set these three in the Render dashboard (Environment tab).
+      - key: LIVEKIT_URL
+        sync: false
+      - key: LIVEKIT_API_KEY
+        sync: false
+      - key: LIVEKIT_API_SECRET
+        sync: false

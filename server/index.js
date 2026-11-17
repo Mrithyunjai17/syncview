@@ -1,379 +1,209 @@
+import 'dotenv/config';
 import express from 'express';
-import { createServer } from 'http';
-import { Server } from 'socket.io';
 import cors from 'cors';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { nanoid } from 'nanoid';
+import { customAlphabet } from 'nanoid';
+import { AccessToken, RoomServiceClient, TrackSource } from 'livekit-server-sdk';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const PORT = process.env.PORT || 3001;
+const PORT = Number(process.env.PORT) || 3001;
 const isProd = process.env.NODE_ENV === 'production';
 
-function getCorsOrigin() {
-  if (process.env.CLIENT_ORIGIN) {
-    return process.env.CLIENT_ORIGIN.split(',').map((value) => value.trim()).filter(Boolean);
-  }
-  return isProd ? true : 'http://localhost:5173';
+const LIVEKIT_URL = process.env.LIVEKIT_URL || '';
+const LIVEKIT_API_KEY = process.env.LIVEKIT_API_KEY || '';
+const LIVEKIT_API_SECRET = process.env.LIVEKIT_API_SECRET || '';
+const livekitConfigured = Boolean(LIVEKIT_URL && LIVEKIT_API_KEY && LIVEKIT_API_SECRET);
+
+if (!livekitConfigured) {
+  console.warn('LiveKit is not configured. Set LIVEKIT_URL, LIVEKIT_API_KEY and LIVEKIT_API_SECRET (see server/.env.example).');
 }
 
-const corsOrigin = getCorsOrigin();
+// RoomServiceClient talks HTTP(S); the client SDK uses the ws(s) form of the same URL.
+const roomService = livekitConfigured
+  ? new RoomServiceClient(LIVEKIT_URL.replace(/^ws/, 'http'), LIVEKIT_API_KEY, LIVEKIT_API_SECRET)
+  : null;
 
-const app = express();
-// Behind Render's proxy, req.ip must come from X-Forwarded-For for per-client rate limiting.
-if (isProd) app.set('trust proxy', 1);
-app.use(cors({ origin: corsOrigin }));
-app.use(express.json());
+/** Room codes avoid look-alike characters so they are easy to read out loud. */
+const newRoomId = customAlphabet('23456789abcdefghjkmnpqrstuvwxyz', 8);
+const newIdentitySuffix = customAlphabet('23456789abcdefghjkmnpqrstuvwxyz', 6);
+const ROOM_ID_PATTERN = /^[a-z0-9]{8}$/;
 
-const httpServer = createServer(app);
-const io = new Server(httpServer, {
-  cors: { origin: corsOrigin, methods: ['GET', 'POST'] },
-  pingInterval: 10000,
-  pingTimeout: 5000,
-});
+const ROOM = {
+  /** Seconds a room stays open if nobody joins it. */
+  emptyTimeout: 10 * 60,
+  /** Seconds a room survives after the last person leaves, so a refresh can rejoin. */
+  departureTimeout: 2 * 60,
+  maxParticipants: 12,
+};
 
-/** @type {Map<string, Room>} */
-const rooms = new Map();
+// ---------------------------------------------------------------------------
+// Small per-IP rate limiter (in memory; good enough for a single instance).
+// ---------------------------------------------------------------------------
+function createLimiter({ windowMs, max }) {
+  const buckets = new Map();
+  setInterval(() => {
+    const now = Date.now();
+    buckets.forEach((bucket, key) => {
+      if (bucket.resetAt <= now) buckets.delete(key);
+    });
+  }, windowMs).unref();
 
-/** How long a room that nobody has joined yet is kept. */
-const UNJOINED_ROOM_TTL_MS = 10 * 60 * 1000;
-/** How long an emptied room survives so a refresh/reconnect can rejoin it. */
-const EMPTY_ROOM_GRACE_MS = 60 * 1000;
-
-/** Room timers live outside the room object so they are never serialized. */
-const roomCleanupTimers = new Map();
-
-function cancelRoomCleanup(roomId) {
-  clearTimeout(roomCleanupTimers.get(roomId));
-  roomCleanupTimers.delete(roomId);
-}
-
-function scheduleRoomCleanup(roomId, delayMs) {
-  cancelRoomCleanup(roomId);
-  const timer = setTimeout(() => {
-    roomCleanupTimers.delete(roomId);
-    const room = rooms.get(roomId);
-    if (room && room.members.length === 0) rooms.delete(roomId);
-  }, delayMs);
-  timer.unref?.();
-  roomCleanupTimers.set(roomId, timer);
-}
-
-const ROOM_CREATE_WINDOW_MS = 10 * 60 * 1000;
-const ROOM_CREATE_LIMIT = 20;
-/** @type {Map<string, { count: number, resetAt: number }>} */
-const roomCreateBuckets = new Map();
-
-function allowRoomCreate(ip) {
-  const now = Date.now();
-  const bucket = roomCreateBuckets.get(ip);
-  if (!bucket || bucket.resetAt <= now) {
-    roomCreateBuckets.set(ip, { count: 1, resetAt: now + ROOM_CREATE_WINDOW_MS });
-    return true;
-  }
-  if (bucket.count >= ROOM_CREATE_LIMIT) return false;
-  bucket.count += 1;
-  return true;
-}
-
-setInterval(() => {
-  const now = Date.now();
-  roomCreateBuckets.forEach((bucket, ip) => {
-    if (bucket.resetAt <= now) roomCreateBuckets.delete(ip);
-  });
-}, ROOM_CREATE_WINDOW_MS).unref();
-
-/**
- * @typedef {Object} Room
- * @property {string} id
- * @property {string} name
- * @property {string} hostId
- * @property {{ active: boolean, title: string, startedAt: number | null }} screenShare
- * @property {Array<{id: string, name: string, joinedAt: number, voiceEnabled: boolean, voiceMuted: boolean}>} members
- * @property {Array<{id: string, user: string, text: string, at: number}>} messages
- * @property {number} createdAt
- */
-
-function createRoom(name) {
-  const id = nanoid(8);
-  /** @type {Room} */
-  const room = {
-    id,
-    name: name || 'Screen Share Room',
-    hostId: '',
-    screenShare: {
-      active: false,
-      title: '',
-      startedAt: null,
-    },
-    members: [],
-    messages: [],
-    createdAt: Date.now(),
-  };
-  rooms.set(id, room);
-  scheduleRoomCleanup(id, UNJOINED_ROOM_TTL_MS);
-  return room;
-}
-
-function getPublicRoom(room) {
-  return {
-    id: room.id,
-    name: room.name,
-    hostId: room.hostId,
-    memberCount: room.members.length,
-    screenShare: room.screenShare,
-    createdAt: room.createdAt,
-  };
-}
-
-function serializeRoom(room) {
-  return {
-    id: room.id,
-    name: room.name,
-    hostId: room.hostId,
-    screenShare: room.screenShare,
-    members: room.members,
-    messages: room.messages.slice(-100),
-  };
-}
-
-app.get('/api/health', (_req, res) => {
-  res.json({ ok: true, rooms: rooms.size });
-});
-
-app.post('/api/rooms', (req, res) => {
-  if (!allowRoomCreate(req.ip || 'unknown')) {
-    return res.status(429).json({ error: 'Too many rooms created. Please wait a few minutes.' });
-  }
-  const room = createRoom(req.body?.name);
-  res.json(getPublicRoom(room));
-});
-
-app.get('/api/rooms/:id', (req, res) => {
-  const room = rooms.get(req.params.id);
-  if (!room) return res.status(404).json({ error: 'Room not found' });
-  res.json(getPublicRoom(room));
-});
-
-const clientDist = path.join(__dirname, '../client/dist');
-
-if (fs.existsSync(clientDist)) {
-  app.use(express.static(clientDist));
-
-  app.get('*', (req, res, next) => {
-    if (req.path.startsWith('/api') || req.path.startsWith('/socket.io')) {
+  return (req, res, next) => {
+    const key = req.ip || 'unknown';
+    const now = Date.now();
+    const bucket = buckets.get(key);
+    if (!bucket || bucket.resetAt <= now) {
+      buckets.set(key, { count: 1, resetAt: now + windowMs });
       return next();
     }
-
-    res.sendFile(path.join(clientDist, 'index.html'), (err) => {
-      if (err) res.status(404).json({ error: 'Not found' });
-    });
-  });
-} else if (isProd) {
-  console.warn('client/dist not found — run "npm run build" before starting in production.');
+    if (bucket.count >= max) {
+      res.set('Retry-After', String(Math.ceil((bucket.resetAt - now) / 1000)));
+      return res.status(429).json({ error: 'Too many requests. Please wait a few minutes.' });
+    }
+    bucket.count += 1;
+    return next();
+  };
 }
 
-io.on('connection', (socket) => {
-  let currentRoomId = null;
-  let userName = 'Guest';
+const createRoomLimiter = createLimiter({ windowMs: 10 * 60 * 1000, max: 20 });
+const tokenLimiter = createLimiter({ windowMs: 60 * 1000, max: 60 });
 
-  socket.on('room:join', ({ roomId, name }, ack) => {
-    const room = rooms.get(roomId);
-    if (!room) {
-      ack?.({ ok: false, error: 'Room not found' });
-      return;
-    }
+// ---------------------------------------------------------------------------
+// App
+// ---------------------------------------------------------------------------
+const app = express();
+// Behind Render's proxy, req.ip must come from X-Forwarded-For for per-client limits.
+if (isProd) app.set('trust proxy', 1);
+app.disable('x-powered-by');
+app.use(cors({ origin: process.env.CLIENT_ORIGIN?.split(',').map((v) => v.trim()) || (isProd ? false : true) }));
+app.use(express.json({ limit: '4kb' }));
 
-    userName = (name || 'Guest').trim().slice(0, 24) || 'Guest';
-    currentRoomId = roomId;
-    socket.join(roomId);
-    cancelRoomCleanup(roomId);
+function cleanText(value, maxLength) {
+  return typeof value === 'string' ? value.replace(/\s+/g, ' ').trim().slice(0, maxLength) : '';
+}
 
-    if (!room.hostId) room.hostId = socket.id;
+function parseTitle(metadata) {
+  try {
+    return JSON.parse(metadata || '{}').title || 'Watch party';
+  } catch {
+    return 'Watch party';
+  }
+}
 
-    const existing = room.members.find((m) => m.id === socket.id);
-    if (!existing) {
-      room.members.push({
-        id: socket.id,
-        name: userName,
-        joinedAt: Date.now(),
-        voiceEnabled: false,
-        voiceMuted: false,
-      });
-      room.messages.push({
-        id: nanoid(),
-        user: 'System',
-        text: `${userName} joined the room`,
-        at: Date.now(),
-      });
-    } else {
-      existing.name = userName;
-    }
+async function findRoom(roomId) {
+  if (!ROOM_ID_PATTERN.test(roomId)) return null;
+  const [room] = await roomService.listRooms([roomId]);
+  return room || null;
+}
 
-    ack?.({ ok: true, room: serializeRoom(room), youAreHost: room.hostId === socket.id });
-    io.to(roomId).emit('room:update', serializeRoom(room));
-
+/** A join token scoped to one room. Viewers can talk and share, but never publish a camera. */
+function createJoinToken(roomId, name) {
+  // A fresh identity per join: a refresh never collides with the old, still-closing session.
+  const token = new AccessToken(LIVEKIT_API_KEY, LIVEKIT_API_SECRET, {
+    identity: `${name.toLowerCase().replace(/[^a-z0-9]+/g, '-').slice(0, 16) || 'guest'}-${newIdentitySuffix()}`,
+    name,
+    ttl: '6h',
   });
-
-  socket.on('chat:send', ({ text }, ack) => {
-    const room = rooms.get(currentRoomId);
-    if (!room) return ack?.({ ok: false });
-
-    const message = text?.trim().slice(0, 500);
-    if (!message) return ack?.({ ok: false });
-
-    const entry = { id: nanoid(), user: userName, text: message, at: Date.now() };
-    room.messages.push(entry);
-    if (room.messages.length > 200) room.messages.shift();
-
-    io.to(currentRoomId).emit('chat:message', entry);
-    ack?.({ ok: true });
+  token.addGrant({
+    room: roomId,
+    roomJoin: true,
+    canSubscribe: true,
+    canPublish: true,
+    canPublishData: true,
+    canPublishSources: [TrackSource.MICROPHONE, TrackSource.SCREEN_SHARE, TrackSource.SCREEN_SHARE_AUDIO],
   });
+  return token.toJwt();
+}
 
-  socket.on('screen:start', ({ title }, ack) => {
-    const room = rooms.get(currentRoomId);
-    if (!room || room.hostId !== socket.id) {
-      return ack?.({ ok: false, error: 'Only the host can share their screen' });
-    }
-
-    room.screenShare = {
-      active: true,
-      title: (title || 'Live screen share').trim().slice(0, 120),
-      startedAt: Date.now(),
-    };
-    io.to(currentRoomId).emit('screen:started', room.screenShare);
-    io.to(currentRoomId).emit('room:update', serializeRoom(room));
-    ack?.({ ok: true });
-  });
-
-  socket.on('screen:stop', (_payload, ack) => {
-    const room = rooms.get(currentRoomId);
-    if (!room || room.hostId !== socket.id) {
-      return ack?.({ ok: false, error: 'Only the host can stop screen share' });
-    }
-
-    room.screenShare = { active: false, title: '', startedAt: null };
-    io.to(currentRoomId).emit('screen:stopped');
-    io.to(currentRoomId).emit('room:update', serializeRoom(room));
-    ack?.({ ok: true });
-  });
-
-  const relayToRoomMember = (eventName, payload, field) => {
-    const room = rooms.get(currentRoomId);
-    const targetId = payload?.to;
-    if (!room || !targetId || !room.members.some((member) => member.id === targetId)) return;
-    if (!payload[field]) return;
-    io.to(targetId).emit(eventName, { from: socket.id, [field]: payload[field] });
-  };
-
-  socket.on('webrtc:offer', (payload) => relayToRoomMember('webrtc:offer', payload, 'offer'));
-  socket.on('webrtc:answer', (payload) => relayToRoomMember('webrtc:answer', payload, 'answer'));
-  socket.on('webrtc:ice-candidate', (payload) => {
-    relayToRoomMember('webrtc:ice-candidate', payload, 'candidate');
-  });
-
-  socket.on('webrtc:viewer-ready', () => {
-    const room = rooms.get(currentRoomId);
-    if (!room?.screenShare.active || room.hostId === socket.id) return;
-    io.to(room.hostId).emit('webrtc:viewer-ready', { viewerId: socket.id });
-  });
-
-  socket.on('voice:state', ({ enabled, muted }, ack) => {
-    const room = rooms.get(currentRoomId);
-    const member = room?.members.find((entry) => entry.id === socket.id);
-    if (!room || !member) return ack?.({ ok: false });
-    member.voiceEnabled = Boolean(enabled);
-    member.voiceMuted = member.voiceEnabled ? Boolean(muted) : false;
-    if (!member.voiceEnabled || member.voiceMuted) {
-      io.to(currentRoomId).emit('voice:activity', { memberId: socket.id, speaking: false });
-    }
-    io.to(currentRoomId).emit('room:update', serializeRoom(room));
-    ack?.({ ok: true });
-  });
-
-  socket.on('voice:activity', ({ speaking }) => {
-    const room = rooms.get(currentRoomId);
-    const member = room?.members.find((entry) => entry.id === socket.id);
-    if (!room || !member?.voiceEnabled || member.voiceMuted) return;
-    socket.to(currentRoomId).emit('voice:activity', {
-      memberId: socket.id,
-      speaking: Boolean(speaking),
+function requireLivekit(_req, res, next) {
+  if (!roomService) {
+    return res.status(503).json({
+      error: 'The server is missing its LiveKit settings. Add them to server/.env and restart.',
     });
-  });
+  }
+  return next();
+}
 
-  socket.on('voice:signal', ({ to, type, data }) => {
-    const room = rooms.get(currentRoomId);
-    const sender = room?.members.find((member) => member.id === socket.id);
-    const target = room?.members.find((member) => member.id === to);
-    if (!room || !sender?.voiceEnabled || !target?.voiceEnabled) return;
-    if (!['offer', 'answer', 'ice'].includes(type) || !data) return;
-    io.to(to).emit('voice:signal', { from: socket.id, type, data });
-  });
+/** Wrap async handlers so a LiveKit outage returns a clean 502 instead of crashing. */
+const route = (handler) => async (req, res) => {
+  try {
+    await handler(req, res);
+  } catch (error) {
+    console.error(`${req.method} ${req.path} failed:`, error?.message || error);
+    if (!res.headersSent) res.status(502).json({ error: 'Could not reach the media server. Try again.' });
+  }
+};
 
-  socket.on('host:transfer', ({ targetId }, ack) => {
-    const room = rooms.get(currentRoomId);
-    if (!room || room.hostId !== socket.id) {
-      return ack?.({ ok: false, error: 'Only the host can transfer host' });
-    }
-
-    const target = room.members.find((m) => m.id === targetId);
-    if (!target) return ack?.({ ok: false, error: 'Member not found' });
-
-    room.hostId = targetId;
-    room.screenShare = { active: false, title: '', startedAt: null };
-    room.messages.push({
-      id: nanoid(),
-      user: 'System',
-      text: `${target.name} is now the host`,
-      at: Date.now(),
-    });
-
-    io.to(currentRoomId).emit('screen:stopped');
-    io.to(currentRoomId).emit('room:update', serializeRoom(room));
-    ack?.({ ok: true });
-  });
-
-  socket.on('disconnect', () => {
-    if (!currentRoomId) return;
-    const room = rooms.get(currentRoomId);
-    if (!room) return;
-
-    room.members = room.members.filter((m) => m.id !== socket.id);
-
-    if (room.members.length === 0) {
-      // Keep the room briefly so a refresh or network blip can rejoin it.
-      // The next person to join becomes host.
-      room.hostId = '';
-      room.screenShare = { active: false, title: '', startedAt: null };
-      scheduleRoomCleanup(currentRoomId, EMPTY_ROOM_GRACE_MS);
-      return;
-    }
-
-    const hostLeft = room.hostId === socket.id;
-    if (hostLeft) {
-      room.hostId = room.members[0].id;
-      room.screenShare = { active: false, title: '', startedAt: null };
-      room.messages.push({
-        id: nanoid(),
-        user: 'System',
-        text: `${room.members[0].name} is now the host`,
-        at: Date.now(),
-      });
-    }
-
-    room.messages.push({
-      id: nanoid(),
-      user: 'System',
-      text: `${userName} left the room`,
-      at: Date.now(),
-    });
-
-    if (hostLeft) io.to(currentRoomId).emit('screen:stopped');
-    io.to(currentRoomId).emit('room:update', serializeRoom(room));
-  });
+app.get('/api/health', (_req, res) => {
+  res.json({ ok: true, livekit: livekitConfigured });
 });
 
-httpServer.listen(PORT, () => {
-  console.log(`SyncView server running on port ${PORT}${isProd ? ' (production)' : ''}`);
+app.post('/api/rooms', requireLivekit, createRoomLimiter, route(async (req, res) => {
+  const title = cleanText(req.body?.title, 48) || 'Watch party';
+  const name = cleanText(req.body?.name, 24);
+  const id = newRoomId();
+  await roomService.createRoom({
+    name: id,
+    emptyTimeout: ROOM.emptyTimeout,
+    departureTimeout: ROOM.departureTimeout,
+    maxParticipants: ROOM.maxParticipants,
+    metadata: JSON.stringify({ title }),
+  });
+  console.log(`create room=${id} title="${title}" by="${name}"`);
+  // The creator joins straight away, so hand back their token now and save
+  // two extra round trips to LiveKit.
+  const join = name ? { token: await createJoinToken(id, name), url: LIVEKIT_URL } : null;
+  res.status(201).json({ id, title, join });
+}));
+
+app.get('/api/rooms/:id', requireLivekit, route(async (req, res) => {
+  const room = await findRoom(req.params.id);
+  if (!room) return res.status(404).json({ error: 'This room does not exist or has closed.' });
+  res.json({ id: room.name, title: parseTitle(room.metadata), participants: room.numParticipants });
+}));
+
+app.post('/api/rooms/:id/token', requireLivekit, tokenLimiter, route(async (req, res) => {
+  const name = cleanText(req.body?.name, 24);
+  if (!name) return res.status(400).json({ error: 'Enter a display name.' });
+
+  const room = await findRoom(req.params.id);
+  if (!room) return res.status(404).json({ error: 'This room does not exist or has closed.' });
+  if (room.numParticipants >= ROOM.maxParticipants) {
+    return res.status(409).json({ error: 'This room is full.' });
+  }
+
+  console.log(`join room=${room.name} name="${name}" alreadyInRoom=${room.numParticipants}`);
+  res.json({ token: await createJoinToken(room.name, name), url: LIVEKIT_URL, title: parseTitle(room.metadata) });
+}));
+
+// Browsers report connection problems here so they show up in the server log.
+const clientLogLimiter = createLimiter({ windowMs: 60 * 1000, max: 30 });
+app.post('/api/client-log', clientLogLimiter, (req, res) => {
+  const event = cleanText(req.body?.event, 40);
+  const room = cleanText(req.body?.room, 16);
+  const detail = cleanText(req.body?.detail, 400);
+  const browser = cleanText(req.body?.browser, 160);
+  console.log(`client ${event} room=${room} detail="${detail}" browser="${browser}"`);
+  res.status(204).end();
+});
+
+app.use('/api', (_req, res) => res.status(404).json({ error: 'Not found' }));
+
+// ---------------------------------------------------------------------------
+// Production client
+// ---------------------------------------------------------------------------
+const clientDist = path.join(__dirname, '../client/dist');
+if (fs.existsSync(clientDist)) {
+  // Hashed build assets never change, so they can be cached forever.
+  app.use('/assets', express.static(path.join(clientDist, 'assets'), { immutable: true, maxAge: '1y' }));
+  app.use(express.static(clientDist, { index: false, maxAge: '1h' }));
+  app.get('*', (_req, res) => res.sendFile(path.join(clientDist, 'index.html')));
+} else if (isProd) {
+  console.warn('client/dist not found. Run "npm run build" before starting in production.');
+}
+
+app.listen(PORT, () => {
+  console.log(`SyncView server on http://localhost:${PORT}${isProd ? ' (production)' : ''}`);
 });

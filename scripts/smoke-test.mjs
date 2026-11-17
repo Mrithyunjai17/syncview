@@ -1,84 +1,57 @@
-import { io } from '../client/node_modules/socket.io-client/build/esm/index.js';
-
+// API smoke test. Run against a running server:  npm run test:smoke
+// With LiveKit configured it exercises the full room + token flow;
+// without it, it checks that the server reports the missing config cleanly.
 const BASE_URL = process.env.TEST_URL || 'http://localhost:3001';
-const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 function assert(condition, message) {
   if (!condition) throw new Error(message);
 }
 
-function connect() {
-  return new Promise((resolve, reject) => {
-    const socket = io(BASE_URL, { transports: ['websocket'], forceNew: true });
-    socket.once('connect', () => resolve(socket));
-    socket.once('connect_error', reject);
+async function call(path, options = {}) {
+  const res = await fetch(`${BASE_URL}${path}`, {
+    ...options,
+    headers: { 'Content-Type': 'application/json' },
   });
+  return { status: res.status, body: await res.json().catch(() => ({})) };
 }
 
-function emitAck(socket, event, payload) {
-  return new Promise((resolve) => socket.emit(event, payload, resolve));
+const health = await call('/api/health');
+assert(health.status === 200 && health.body.ok, 'Health check failed');
+
+if (!health.body.livekit) {
+  const create = await call('/api/rooms', { method: 'POST', body: '{}' });
+  assert(create.status === 503, `Expected 503 without LiveKit config, got ${create.status}`);
+  console.log('Smoke test passed (LiveKit not configured): health OK, room creation reports missing config.');
+  process.exit(0);
 }
 
-const roomResponse = await fetch(`${BASE_URL}/api/rooms`, {
-  method: 'POST',
-  headers: { 'Content-Type': 'application/json' },
-  body: JSON.stringify({ name: 'Automated smoke test' }),
-});
-assert(roomResponse.ok, 'Room creation failed');
-const room = await roomResponse.json();
+const create = await call('/api/rooms', { method: 'POST', body: JSON.stringify({ title: '  Smoke   test ' }) });
+assert(create.status === 201 && /^[a-z0-9]{8}$/.test(create.body.id), `Room creation failed: ${JSON.stringify(create)}`);
+assert(create.body.title === 'Smoke test', 'Room title was not cleaned');
 
-const host = await connect();
-const viewer = await connect();
-const hostJoin = await emitAck(host, 'room:join', { roomId: room.id, name: 'Host' });
-const viewerJoin = await emitAck(viewer, 'room:join', { roomId: room.id, name: 'Viewer' });
-assert(hostJoin.ok && hostJoin.youAreHost, 'First member was not assigned host');
-assert(viewerJoin.ok && !viewerJoin.youAreHost, 'Viewer joined incorrectly');
+const info = await call(`/api/rooms/${create.body.id}`);
+assert(info.status === 200 && info.body.title === 'Smoke test', `Room lookup failed: ${JSON.stringify(info)}`);
 
-const screenStart = await emitAck(host, 'screen:start', { title: 'Test share' });
-assert(screenStart.ok, 'Host could not start screen sharing');
+const missing = await call('/api/rooms/zzzzzzzz');
+assert(missing.status === 404, `Expected 404 for unknown room, got ${missing.status}`);
 
-let incorrectlyStopped = false;
-host.once('screen:stopped', () => { incorrectlyStopped = true; });
-viewer.disconnect();
-await wait(150);
-assert(!incorrectlyStopped, 'A viewer disconnect incorrectly stopped the host screen share');
+const badCode = await call('/api/rooms/NOT-A-CODE');
+assert(badCode.status === 404, `Expected 404 for malformed code, got ${badCode.status}`);
 
-const activeRoomResponse = await fetch(`${BASE_URL}/api/rooms/${room.id}`);
-const activeRoom = await activeRoomResponse.json();
-assert(activeRoom.screenShare.active, 'Room lost active screen state after viewer left');
+const noName = await call(`/api/rooms/${create.body.id}/token`, { method: 'POST', body: JSON.stringify({ name: '  ' }) });
+assert(noName.status === 400, `Expected 400 without a name, got ${noName.status}`);
 
-const voicePeer = await connect();
-await emitAck(voicePeer, 'room:join', { roomId: room.id, name: 'Voice peer' });
-assert((await emitAck(host, 'voice:state', { enabled: true })).ok, 'Host voice state failed');
-assert((await emitAck(voicePeer, 'voice:state', { enabled: true })).ok, 'Peer voice state failed');
+const token = await call(`/api/rooms/${create.body.id}/token`, { method: 'POST', body: JSON.stringify({ name: 'Smoke Tester' }) });
+assert(token.status === 200 && token.body.token && token.body.url, `Token request failed: ${JSON.stringify(token)}`);
 
-const mutedRoomUpdate = new Promise((resolve) => {
-  host.on('room:update', (updatedRoom) => {
-    if (updatedRoom.members.find((member) => member.id === voicePeer.id)?.voiceMuted) resolve(updatedRoom);
-  });
-});
-await emitAck(voicePeer, 'voice:state', { enabled: true, muted: true });
-assert(await Promise.race([mutedRoomUpdate, wait(1000).then(() => null)]), 'Muted voice state was not broadcast');
-await emitAck(voicePeer, 'voice:state', { enabled: true, muted: false });
+const claims = JSON.parse(Buffer.from(token.body.token.split('.')[1], 'base64url').toString());
+assert(claims.video?.room === create.body.id && claims.video?.roomJoin, 'Token is not scoped to the room');
+assert(!claims.video?.canPublishSources?.includes('camera'), 'Token should not allow camera publishing');
+assert(claims.name === 'Smoke Tester', 'Token is missing the display name');
 
-const activityRelay = new Promise((resolve) => host.once('voice:activity', resolve));
-voicePeer.emit('voice:activity', { speaking: true });
-const activity = await Promise.race([activityRelay, wait(1000).then(() => null)]);
-assert(activity?.memberId === voicePeer.id && activity?.speaking, 'Voice activity was not relayed');
+const withCreator = await call('/api/rooms', { method: 'POST', body: JSON.stringify({ title: 'Creator', name: 'Host' }) });
+assert(withCreator.status === 201 && withCreator.body.join?.token, 'Room creation with a name should return the creator token');
+const creatorClaims = JSON.parse(Buffer.from(withCreator.body.join.token.split('.')[1], 'base64url').toString());
+assert(creatorClaims.video?.room === withCreator.body.id, 'Creator token is not scoped to the new room');
 
-const relayedSignal = new Promise((resolve) => {
-  voicePeer.once('voice:signal', resolve);
-});
-host.emit('voice:signal', {
-  to: voicePeer.id,
-  type: 'offer',
-  data: { type: 'offer', sdp: 'smoke-test' },
-});
-const signal = await Promise.race([relayedSignal, wait(1000).then(() => null)]);
-assert(signal?.from === host.id && signal?.type === 'offer', 'Voice signaling was not relayed');
-
-await emitAck(host, 'screen:stop', {});
-host.disconnect();
-voicePeer.disconnect();
-
-console.log('Smoke test passed: room, screen lifecycle, mute state, speaking activity, and voice signaling.');
+console.log(`Smoke test passed: rooms ${create.body.id} and ${withCreator.body.id} created, looked up, and scoped join tokens issued.`);
