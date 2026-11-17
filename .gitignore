@@ -2,6 +2,7 @@ node_modules/
 dist/
 .env
 .env.*
+!server/.env.example
 *.log
 .DS_Store
 .codex-remote-attachments/

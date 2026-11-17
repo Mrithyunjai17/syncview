@@ -1,90 +1,58 @@
 import { useEffect, useRef, useState } from 'react';
+import Icon from './Icon.jsx';
 
-export default function ChatPanel({ socket, messages = [] }) {
+const timeFormat = new Intl.DateTimeFormat(undefined, { hour: 'numeric', minute: '2-digit' });
+
+export default function ChatPanel({ chat }) {
+  const { chatMessages, send, isSending } = chat;
   const [text, setText] = useState('');
-  const [liveMessages, setLiveMessages] = useState(messages);
   const listRef = useRef(null);
 
   useEffect(() => {
-    setLiveMessages(messages);
-  }, [messages]);
+    const list = listRef.current;
+    if (list) list.scrollTop = list.scrollHeight;
+  }, [chatMessages.length]);
 
-  useEffect(() => {
-    if (!socket) return undefined;
-
-    const onMessage = (message) => {
-      setLiveMessages((prev) => [...prev, message]);
-    };
-
-    socket.on('chat:message', onMessage);
-    return () => socket.off('chat:message', onMessage);
-  }, [socket]);
-
-  useEffect(() => {
-    const el = listRef.current;
-    if (el) el.scrollTop = el.scrollHeight;
-  }, [liveMessages]);
-
-  const sendMessage = (event) => {
+  const submit = async (event) => {
     event.preventDefault();
-    if (!socket || !text.trim()) return;
-
-    socket.emit('chat:send', { text }, (response) => {
-      if (response?.ok) setText('');
-    });
+    const message = text.trim();
+    if (!message || isSending) return;
+    setText('');
+    try {
+      await send(message);
+    } catch {
+      setText(message);
+    }
   };
 
   return (
-    <>
-      <div className="chat-list" ref={listRef}>
-        {liveMessages.map((message) => (
-          <div
-            key={message.id}
-            className={`chat-message ${message.user === 'System' ? 'system' : ''}`}
-          >
-            {message.user !== 'System' && <div className="author">{message.user}</div>}
-            <div>{message.text}</div>
-            <div className="time">{new Date(message.at).toLocaleTimeString()}</div>
-          </div>
+    <div className="chat">
+      <ol className="chat-list" ref={listRef} aria-live="polite">
+        {chatMessages.length === 0 && (
+          <li className="chat-empty muted">Messages are only seen by people in the room right now.</li>
+        )}
+        {chatMessages.map((msg) => (
+          <li key={msg.id ?? msg.timestamp} className={`chat-msg ${msg.from?.isLocal ? 'mine' : ''}`}>
+            <div className="chat-meta">
+              <strong>{msg.from?.isLocal ? 'You' : msg.from?.name || msg.from?.identity || 'Someone'}</strong>
+              <time>{timeFormat.format(msg.timestamp)}</time>
+            </div>
+            <p>{msg.message}</p>
+          </li>
         ))}
-      </div>
-
-      <form className="chat-input-row" onSubmit={sendMessage}>
+      </ol>
+      <form className="chat-form" onSubmit={submit}>
         <input
           value={text}
           onChange={(e) => setText(e.target.value)}
-          placeholder="Say something…"
+          placeholder="Send a message"
           maxLength={500}
+          aria-label="Message"
         />
-        <button className="btn btn-primary" type="submit">
-          Send
+        <button className="icon-btn send" disabled={!text.trim() || isSending} aria-label="Send">
+          <Icon name="send" size={18} />
         </button>
       </form>
-    </>
-  );
-}
-
-export function MembersPanel({ members = [], isHost, socket, hostId }) {
-  const transferHost = (targetId) => {
-    if (!socket || !isHost) return;
-    socket.emit('host:transfer', { targetId });
-  };
-
-  return (
-    <div className="member-list">
-      {members.map((member) => (
-        <div key={member.id} className="member-item">
-          <div>
-            <div className="name">{member.name}</div>
-            {member.id === hostId && <span className="pill pill-host">Host</span>}
-          </div>
-          {isHost && member.id !== hostId && (
-            <button className="btn btn-ghost" onClick={() => transferHost(member.id)}>
-              Make host
-            </button>
-          )}
-        </div>
-      ))}
     </div>
   );
 }
